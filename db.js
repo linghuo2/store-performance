@@ -199,7 +199,10 @@ window.DB = (function () {
   async function deleteRegion(id) {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
     if (state.db.stores.some(s => s.regionId === id)) return { ok: false, error: '该区域仍有门店，无法删除' };
-    state.db.regions = state.db.regions.filter(r => r.id !== id); publishState(); return { ok: true };
+    state.db.regions = state.db.regions.filter(r => r.id !== id);
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.regions = state.db.deleted.regions || {};
+    state.db.deleted.regions[id] = Date.now();
+    publishState(); return { ok: true };
   }
   async function addStore(body) {
     const me = getCurrentUser();
@@ -207,7 +210,7 @@ window.DB = (function () {
     let regionId = null;
     if (me.role === 'regional') regionId = me.regionId;
     else if (body.regionId) { const reg = state.db.regions.find(r => r.id === body.regionId); if (reg) regionId = reg.id; }
-    state.db.stores.push({ id: 's_' + rand(), name: body.name, commissionRate: Number(body.commissionRate) || 0.1, commissionFixed: Number(body.commissionFixed) || 0, regionId });
+    state.db.stores.push({ id: 's_' + rand(), name: body.name, commissionRate: Number(body.commissionRate) || 0.1, commissionFixed: Number(body.commissionFixed) || 0, regionId, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     publishState(); return { ok: true };
   }
   async function updateStore(id, body) {
@@ -218,6 +221,7 @@ window.DB = (function () {
     if (body.commissionRate !== undefined) { const r = Number(body.commissionRate); if (!isNaN(r)) st.commissionRate = r; }
     if (body.commissionFixed !== undefined) { const f = Number(body.commissionFixed); if (!isNaN(f)) st.commissionFixed = f; }
     if (body.regionId !== undefined && me.role === 'boss') { const reg = state.db.regions.find(r => r.id === body.regionId); if (reg) st.regionId = reg.id; }
+    st.updatedAt = new Date().toISOString();
     publishState(); return { ok: true };
   }
   async function deleteStore(id) {
@@ -228,6 +232,8 @@ window.DB = (function () {
     if (state.db.users.some(x => x.storeId === id && x.active)) return { ok: false, error: '该门店仍有在岗人员，无法删除' };
     state.db.stores = state.db.stores.filter(s => s.id !== id);
     state.db.users = state.db.users.filter(x => x.storeId !== id);
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.stores = state.db.deleted.stores || {};
+    state.db.deleted.stores[id] = Date.now();
     publishState(); return { ok: true };
   }
   async function addUser(body) {
@@ -245,7 +251,8 @@ window.DB = (function () {
       storeId = body.storeId || null; const s = storeId && getStore(storeId);
       if (!s || s.regionId !== me.regionId) return { ok: false, error: '门店须属于本大区' };
     } else { if (body.role !== 'clerk') return { ok: false, error: '无权限' }; storeId = me.storeId; }
-    const nu = { id: 'u_' + rand(), username: body.username, password: await hashPassword(body.password || '123456'), name: body.name, role: body.role, storeId, regionId, active: true, createdAt: new Date().toISOString() };
+    const uNow = new Date().toISOString();
+    const nu = { id: 'u_' + rand(), username: body.username, password: await hashPassword(body.password || '123456'), name: body.name, role: body.role, storeId, regionId, active: true, createdAt: uNow, updatedAt: uNow };
     state.db.users.push(nu); publishState(); return { ok: true };
   }
   async function updateUser(id, body) {
@@ -262,6 +269,7 @@ window.DB = (function () {
       if (!name) return { ok: false, error: '姓名不能为空' };
       t.name = name;
     }
+    t.updatedAt = new Date().toISOString();
     publishState(); return { ok: true };
   }
   async function deleteUser(id) {
@@ -275,7 +283,10 @@ window.DB = (function () {
     } else if (me.role === 'manager' && t.storeId === me.storeId && t.role === 'clerk') { }
     else return { ok: false, error: '无权限' };
     if (t.id === me.id) return { ok: false, error: '不能删除自己' };
-    state.db.users = state.db.users.filter(u => u.id !== id); publishState(); return { ok: true };
+    state.db.users = state.db.users.filter(u => u.id !== id);
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.users = state.db.deleted.users || {};
+    state.db.deleted.users[id] = Date.now();
+    publishState(); return { ok: true };
   }
   async function addRecord(body) {
     const me = getCurrentUser();
@@ -302,7 +313,8 @@ window.DB = (function () {
       member.balance = Math.round((member.balance - amount) * 100) / 100;
       memberId = member.id; memberName = member.name;
     }
-    const rec = { id: 'r_' + rand(), storeId, storeName: store.name, clerkId, clerkName, date, amount, category, subCategory, payMethod, memberId, memberName, commission: calcCommission(amount, store, findSubCategory(category, subCategory)), note: body.note || '', createdBy: me.id, createdAt: new Date().toISOString() };
+    const nowIso = new Date().toISOString();
+    const rec = { id: 'r_' + rand(), storeId, storeName: store.name, clerkId, clerkName, date, amount, category, subCategory, payMethod, memberId, memberName, commission: calcCommission(amount, store, findSubCategory(category, subCategory)), note: body.note || '', createdBy: me.id, createdAt: nowIso, updatedAt: nowIso };
     state.db.records.push(rec); publishState(); return { ok: true, record: rec };
   }
   async function updateRecord(id, body) {
@@ -343,6 +355,7 @@ window.DB = (function () {
       rec.memberName = m.name;
     } else { rec.memberId = null; rec.memberName = null; }
     rec.commission = calcCommission(rec.amount, getStore(rec.storeId), findSubCategory(rec.category, rec.subCategory));
+    rec.updatedAt = new Date().toISOString();
     publishState(); return { ok: true };
   }
   async function deleteRecord(id) {
@@ -355,7 +368,10 @@ window.DB = (function () {
       const m = (state.db.members || []).find(x => x.id === rec.memberId);
       if (m) m.balance = Math.round((m.balance + rec.amount) * 100) / 100;
     }
-    state.db.records = state.db.records.filter(r => r.id !== id); publishState(); return { ok: true };
+    state.db.records = state.db.records.filter(r => r.id !== id);
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.records = state.db.deleted.records || {};
+    state.db.deleted.records[id] = Date.now(); // 墓碑：防止其他设备把已删记录"复活"
+    publishState(); return { ok: true };
   }
   async function addCategory(name) {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
@@ -370,16 +386,27 @@ window.DB = (function () {
     if (newName !== oldName && state.db.categories.some(c => c.name === newName)) return { ok: false, error: '该大类名已存在' };
     const cat = state.db.categories.find(c => c.name === oldName); if (!cat) return { ok: false, error: '大类不存在' };
     if (newName !== oldName) state.db.records.forEach(r => { if (r.category === oldName) r.category = newName; });
-    cat.name = newName; publishState(); return { ok: true };
+    cat.name = newName;
+    cat.updatedAt = new Date().toISOString();
+    if (newName !== oldName) {
+      state.db.deleted = state.db.deleted || {}; state.db.deleted.categories = state.db.deleted.categories || {};
+      state.db.deleted.categories[oldName] = Date.now();
+    }
+    publishState(); return { ok: true };
   }
   async function deleteCategory(name) {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
-    state.db.categories = state.db.categories.filter(c => c.name !== name); publishState(); return { ok: true };
+    state.db.categories = state.db.categories.filter(c => c.name !== name);
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.categories = state.db.deleted.categories || {};
+    state.db.deleted.categories[name] = Date.now();
+    publishState(); return { ok: true };
   }
   async function setSubs(catName, subs, renameSub) {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
     const cat = state.db.categories.find(c => c.name === catName); if (!cat) return { ok: false, error: '大类不存在' };
-    cat.subs = subs;
+    const sNow = new Date().toISOString();
+    cat.subs = (Array.isArray(subs) ? subs : []).map(s => (s && typeof s === 'object') ? Object.assign({}, s, { updatedAt: sNow }) : s);
+    cat.updatedAt = sNow;
     if (renameSub && renameSub.from != null && renameSub.to != null && String(renameSub.from) !== String(renameSub.to)) {
       const from = String(renameSub.from), to = String(renameSub.to).trim();
       state.db.records.forEach(r => { if (r.category === catName && r.subCategory === from) r.subCategory = to; });
@@ -418,7 +445,8 @@ window.DB = (function () {
     const balance = Number(body.balance);
     if (!(balance >= 0)) return { ok: false, error: '初始余额需为非负数字' };
     state.db.members = state.db.members || [];
-    state.db.members.push({ id: 'm_' + rand(), name: String(body.name).trim(), phone: String(body.phone || '').trim(), balance: Math.round(balance * 100) / 100, storeId, createdAt: new Date().toISOString() });
+    const mNow = new Date().toISOString();
+    state.db.members.push({ id: 'm_' + rand(), name: String(body.name).trim(), phone: String(body.phone || '').trim(), balance: Math.round(balance * 100) / 100, storeId, createdAt: mNow, updatedAt: mNow });
     publishState(); return { ok: true };
   }
   async function updateMember(id, body) {
@@ -426,6 +454,7 @@ window.DB = (function () {
     if (!canManageMember(me, m)) return { ok: false, error: '无权限' };
     if (body.name !== undefined) { const n = String(body.name || '').trim(); if (!n) return { ok: false, error: '姓名不能为空' }; m.name = n; }
     if (body.phone !== undefined) m.phone = String(body.phone || '').trim();
+    m.updatedAt = new Date().toISOString();
     publishState(); return { ok: true };
   }
   async function rechargeMember(id, amount) {
@@ -433,13 +462,17 @@ window.DB = (function () {
     if (!canManageMember(me, m)) return { ok: false, error: '无权限' };
     const amt = Number(amount); if (!(amt > 0)) return { ok: false, error: '充值金额需大于 0' };
     m.balance = Math.round((m.balance + amt) * 100) / 100;
+    m.updatedAt = new Date().toISOString();
     publishState(); return { ok: true };
   }
   async function deleteMember(id) {
     const me = getCurrentUser(); const m = (state.db.members || []).find(x => x.id === id); if (!m) return { ok: false, error: '会员不存在' };
     if (!canManageMember(me, m)) return { ok: false, error: '无权限' };
+    const rNow = new Date().toISOString();
     state.db.members = state.db.members.filter(x => x.id !== id);
-    state.db.records.forEach(r => { if (r.memberId === id) r.memberId = null; }); // 保留消费记录，仅解除关联
+    state.db.records.forEach(r => { if (r.memberId === id) { r.memberId = null; r.updatedAt = rNow; } }); // 保留消费记录，仅解除关联
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.members = state.db.deleted.members || {};
+    state.db.deleted.members[id] = Date.now();
     publishState(); return { ok: true };
   }
 
@@ -454,12 +487,91 @@ window.DB = (function () {
     if (!Array.isArray(state.db.stores)) state.db.stores = [];
     if (!Array.isArray(state.db.regions)) state.db.regions = [];
     if (!Array.isArray(state.db.categories)) state.db.categories = defaultCategories();
+    if (!state.db.deleted || typeof state.db.deleted !== 'object') state.db.deleted = {};
+    ['records', 'users', 'members', 'stores', 'regions', 'categories'].forEach(k => {
+      if (!state.db.deleted[k] || typeof state.db.deleted[k] !== 'object') state.db.deleted[k] = {};
+    });
+  }
+
+  /* ----------------------------- 多端合并（按 id 并集） ----------------------------- */
+  /* 重要：旧版用「整包覆盖 + 版本号大者胜」，只要有一台设备持有旧数据上线，
+     就会把其他设备新增的记录整个抹掉（表现为「数据停在过去的某一天」）。
+     现改为：按 id 取并集 + 更新时间戳新者胜 + 删除墓碑，新增数据永不丢失。 */
+  function tsOf(x) {
+    if (!x) return 0;
+    const t = Date.parse(x.updatedAt || x.createdAt || 0);
+    return isNaN(t) ? 0 : t;
+  }
+  function mergeById(base, inc, key) {
+    const out = new Map();
+    (Array.isArray(base) ? base : []).forEach(x => { if (x && x[key] != null) out.set(String(x[key]), x); });
+    (Array.isArray(inc) ? inc : []).forEach(x => {
+      if (!x || x[key] == null) return;
+      const k = String(x[key]);
+      const cur = out.get(k);
+      if (!cur) { out.set(k, x); return; }        // 新增项：直接并入（旧版会在这里丢数据）
+      if (tsOf(x) > tsOf(cur)) out.set(k, x);      // 同 id 冲突：取更新时间较新的一方
+    });
+    return Array.from(out.values());
+  }
+  function mergeCats(base, inc) {
+    const map = new Map();
+    (Array.isArray(base) ? base : []).forEach(c => { if (c && c.name != null) map.set(String(c.name), Object.assign({}, c, { subs: (c.subs || []).slice() })); });
+    (Array.isArray(inc) ? inc : []).forEach(c => {
+      if (!c || c.name == null) return;
+      const k = String(c.name);
+      let cur = map.get(k);
+      if (!cur) { map.set(k, Object.assign({}, c, { subs: (c.subs || []).slice() })); return; }
+      const subMap = new Map();
+      cur.subs.forEach(s => { const nm = (typeof s === 'object' ? s.name : s); if (nm != null) subMap.set(String(nm), s); });
+      (c.subs || []).forEach(s => {
+        const nm = (typeof s === 'object' ? s.name : s); if (nm == null) return;
+        const kk = String(nm), cs = subMap.get(kk);
+        if (cs == null) { subMap.set(kk, s); return; }
+        if (typeof s === 'object' && typeof cs === 'object') { if (tsOf(s) > tsOf(cs)) subMap.set(kk, s); }
+        else if (typeof s === 'object' && typeof cs !== 'object') subMap.set(kk, s);
+      });
+      cur.subs = Array.from(subMap.values());
+      if (tsOf(c) > tsOf(cur)) { cur.updatedAt = c.updatedAt; }
+    });
+    return Array.from(map.values());
+  }
+  function applyTombstones(d) {
+    const del = (d && d.deleted) || {};
+    const drop = (arrName, key) => {
+      const m = del[arrName];
+      if (!m || !Array.isArray(d[arrName])) return;
+      d[arrName] = d[arrName].filter(x => !(x && x[key] != null && m[String(x[key])]));
+    };
+    drop('records', 'id'); drop('users', 'id'); drop('members', 'id'); drop('stores', 'id'); drop('regions', 'id');
+    const mc = del.categories;
+    if (mc && Array.isArray(d.categories)) d.categories = d.categories.filter(c => !(c && c.name != null && mc[String(c.name)]));
+    return d;
+  }
+  function mergeDB(baseDb, incDb) {
+    const b = baseDb || {}, i = incDb || {};
+    const pick = k => Object.assign({}, (b.deleted && b.deleted[k]) || {}, (i.deleted && i.deleted[k]) || {});
+    const merged = {
+      regions: mergeById(b.regions, i.regions, 'id'),
+      stores: mergeById(b.stores, i.stores, 'id'),
+      users: mergeById(b.users, i.users, 'id'),
+      records: mergeById(b.records, i.records, 'id'),
+      members: mergeById(b.members, i.members, 'id'),
+      categories: mergeCats(b.categories, i.categories),
+      deleted: { records: pick('records'), users: pick('users'), members: pick('members'), stores: pick('stores'), regions: pick('regions'), categories: pick('categories') }
+    };
+    return applyTombstones(merged);
   }
   function mergeIncoming(payload) {
     try {
       const inc = JSON.parse(payload);
       if (!inc || !inc.db) return;
-      if (!state || inc.version > state.version) { state = inc; migrateState(); saveLocal(); if (updateCb) updateCb(); }
+      migrateState();
+      state.db = mergeDB(state.db, inc.db);      // 按 id 并集，不再整包覆盖
+      state.version = Math.max(state.version || 0, inc.version || 0);
+      state.ts = Date.now();
+      saveLocal();
+      if (updateCb) updateCb();
     } catch (e) {}
   }
   function connectMQTT() {
