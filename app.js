@@ -95,11 +95,15 @@ function rangeFilteredRecords() {
 
 function toast(msg, isErr) {
   const t = $('#toast');
+  if (!t) return;
   t.textContent = msg;
   t.className = 'toast show' + (isErr ? ' err' : '');
   clearTimeout(t._t);
-  t._t = setTimeout(() => { t.className = 'toast' + (isErr ? ' err' : ''); }, 2200);
+  // 补回数据这类重要提示多停留一会儿
+  t._t = setTimeout(() => { t.className = 'toast' + (isErr ? ' err' : ''); }, isErr ? 2200 : 4200);
 }
+/* 供 db.js 在上传前自检时回调（模块作用域外也要能弹提示） */
+window.__wbSyncToast = toast;
 
 /* ----------------------------- 实时同步状态 ----------------------------- */
 function updateLive() {
@@ -921,8 +925,16 @@ function showDiagPanel() {
         <tr><th>数据版本</th><td>v${info.version || 0}</td></tr>
         <tr><th>状态更新时间</th><td>${info.ts ? new Date(info.ts).toLocaleString('zh-CN') : '—'}</td></tr>
         <tr><th>实时连接</th><td>${info.connected ? '<span style="color:#067647;">已连接</span>' : '<span style="color:#b54708;">未连接（数据暂无法同步）</span>'}</td></tr>
+        ${(function () {
+          const g = info.guard || {};
+          if (!g.hasRemote) return '<tr><th>上传前自检</th><td class="muted">尚未收到线上数据</td></tr>';
+          const heal = g.healed > 0
+            ? `<span style="color:#b54708;">已从线上自动补回 <b>${g.healed}</b> 条${g.healedAt ? '（' + new Date(g.healedAt).toLocaleTimeString('zh-CN') + '）' : ''}</span>`
+            : '<span style="color:#067647;">正常：本机不缺线上记录，不会覆盖他人数据</span>';
+          return `<tr><th>上传前自检</th><td>线上快照 ${g.remoteRecords || 0} 条 / v${g.remoteVer || 0} · ${heal}</td></tr>`;
+        })()}
       </tbody></table>
-      <div class="sc-warn" style="margin-top:12px;">如果本机记录数<b>多于线上看到的数量</b>，点下方按钮把本机数据上传合并到线上。合并是按条并集，<b>不会删除任何一方的记录</b>。</div>
+      <div class="sc-warn" style="margin-top:12px;">如果本机记录数<b>多于线上看到的数量</b>，点下方按钮把本机数据上传合并到线上。合并是按条并集，<b>不会删除任何一方的记录</b>；上传前会自动先把线上缺失的记录并回本机，<b>因此也不会覆盖他人的登记</b>。</div>
       <div class="modal-actions">
         <button class="btn ghost" id="diagClose">关闭</button>
         <button class="btn" id="diagPush">上传本机数据到线上</button>
