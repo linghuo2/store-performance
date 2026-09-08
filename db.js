@@ -674,11 +674,41 @@ window.DB = (function () {
     XLSX.writeFile(wb, '会员信息_' + tag + '.xlsx');
   }
 
+  /* ----------------------------- 同步体检 / 数据抢救 ----------------------------- */
+  function getSyncInfo() {
+    const recs = (state && state.db && state.db.records) || [];
+    const mems = (state && state.db && state.db.members) || [];
+    const dates = recs.map(r => r.date || '').filter(Boolean).sort();
+    const byDate = {};
+    dates.forEach(d => { byDate[d] = (byDate[d] || 0) + 1; });
+    return {
+      room,
+      version: (state && state.version) || 0,
+      ts: (state && state.ts) || 0,
+      connected: !!(client && client.connected),
+      recordCount: recs.length,
+      memberCount: mems.length,
+      firstDate: dates[0] || '',
+      lastDate: dates[dates.length - 1] || '',
+      recentDates: Object.keys(byDate).sort().slice(-7).map(d => d + '(' + byDate[d] + ')')
+    };
+  }
+  /* 强制把本机数据推到线上，用于抢救「本机数据比线上新」的情况 */
+  function forcePushLocal() {
+    if (!state) return false;
+    state.version = (state.version || 0) + 1;
+    state.ts = Date.now();
+    saveLocal();
+    if (client && client.connected) { client.publish('shop/' + room + '/state', JSON.stringify(state), { qos: 0, retain: true }); return true; }
+    return false;
+  }
+
   return {
     init, getRoom, isConnected, getCurrentUser, login, logout, changePassword, resetPassword,
     getDB, computeSummary, accessibleStores, filterRecords, filterUsers, accessibleRegions, getStore, findSubCategory, calcCommission, publicUser,
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
-    addMember, updateMember, rechargeMember, deleteMember, getMembers
+    addMember, updateMember, rechargeMember, deleteMember, getMembers,
+    getSyncInfo, forcePushLocal
   };
 })();
