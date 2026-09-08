@@ -105,6 +105,12 @@ td .c-comm { color: var(--green); font-weight: 600; }
 .qr-wrap { display: flex; align-items: center; justify-content: center; min-height: 220px; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-top: 4px; }
 .qr-img { width: 240px; height: 240px; image-rendering: pixelated; }
 .qr-loading { color: var(--muted); font-size: 13px; text-align: center; padding: 20px; line-height: 1.7; }
+
+/* 数据同步体检 */
+.diag-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.diag-table th { text-align: left; width: 38%; padding: 9px 10px; color: var(--sub); font-weight: 500; background: #fafbfc; border-bottom: 1px solid var(--line); }
+.diag-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); word-break: break-all; }
+.diag-table tr:last-child th, .diag-table tr:last-child td { border-bottom: none; }
 .update-banner { display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 9999; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; background: linear-gradient(135deg,#ff7a45 0%,#ff4d4f 100%); color: #fff; font-size: 13.5px; box-shadow: 0 2px 10px rgba(0,0,0,.18); }
 .update-banner .ub-text { font-weight: 600; }
 .update-banner .ub-btn { flex-shrink: 0; background: #fff; color: #d4380d; border: none; border-radius: 8px; padding: 6px 12px; font-size: 13px; font-weight: 700; cursor: pointer; }
