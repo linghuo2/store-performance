@@ -529,6 +529,101 @@ function categoryBreakdownHTML(byCategory) {
   </div>`;
 }
 
+/* --------------------- 每日汇总（一眼看出哪天漏登记） --------------------- */
+let dailyOnlyMissing = false;
+const WEEK_CN = ['日', '一', '二', '三', '四', '五', '六'];
+function addDaysISO(iso, n) {
+  const p = String(iso).split('-').map(Number);
+  const d = new Date(p[0], (p[1] || 1) - 1, p[2] || 1);
+  d.setDate(d.getDate() + n);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function weekdayOf(iso) {
+  const p = String(iso).split('-').map(Number);
+  return WEEK_CN[new Date(p[0], (p[1] || 1) - 1, p[2] || 1).getDay()];
+}
+function dailyScopeRecords() {
+  if (me && (me.role === 'boss' || me.role === 'regional')) return rangeFilteredRecords();
+  return cache.records || [];
+}
+function dailySummaryHTML(records) {
+  const recs = (records || []).filter(r => (r.date || '').slice(0, 10));
+  if (!recs.length) {
+    return `<div class="section">
+      <h2>每日汇总 <span class="tag">按日期分组 · 红色为漏登记</span></h2>
+      <div class="empty">当前范围内暂无登记记录</div>
+    </div>`;
+  }
+  const byDate = {};
+  recs.forEach(r => {
+    const d = (r.date || '').slice(0, 10);
+    if (!byDate[d]) byDate[d] = { count: 0, sales: 0, commission: 0 };
+    byDate[d].count++;
+    byDate[d].sales += Number(r.amount) || 0;
+    byDate[d].commission += Number(r.commission) || 0;
+  });
+  const dates = Object.keys(byDate).sort();
+  const first = dates[0];
+  const lastReal = dates[dates.length - 1];
+  const endISO = lastReal > today() ? lastReal : today();   // 延伸到今天，才能发现"之后一直没登记"
+  let all = [], cur = first, guard = 0;
+  while (cur <= endISO && guard++ < 400) { all.push(cur); cur = addDaysISO(cur, 1); }
+  if (all.length > 180) all = all.slice(all.length - 180);
+  const missDates = all.filter(d => !byDate[d]);
+  const activeDates = all.filter(d => byDate[d]);
+  const totalSales = activeDates.reduce((s, d) => s + byDate[d].sales, 0);
+  const avg = activeDates.length ? totalSales / activeDates.length : 0;
+  let best = null;
+  activeDates.forEach(d => { if (!best || byDate[d].sales > best.sales) best = { date: d, sales: byDate[d].sales }; });
+
+  let rows = all.slice().reverse().map(d => {
+    const v = byDate[d];
+    if (dailyOnlyMissing && v) return '';
+    if (!v) return `<tr class="daily-miss">
+      <td>${d}</td><td>周${weekdayOf(d)}</td><td>0 笔</td>
+      <td class="c-amount">—</td><td class="c-comm">—</td>
+      <td><span class="badge-miss">未登记</span></td></tr>`;
+    return `<tr>
+      <td>${d}</td><td>周${weekdayOf(d)}</td><td>${v.count} 笔</td>
+      <td class="c-amount">${money(v.sales)}</td><td class="c-comm">${money(v.commission)}</td>
+      <td><span class="badge-ok">已登记</span></td></tr>`;
+  }).join('');
+  if (!rows.trim()) rows = `<tr><td colspan="6" class="muted">没有漏登记的日期 👍</td></tr>`;
+
+  const missTip = missDates.length
+    ? `<div class="daily-warn">以下日期没有任何登记，请核对是否漏录：<br/>${missDates.slice(-40).map(d => d + '（周' + weekdayOf(d) + '）').join('、')}${missDates.length > 40 ? ' 等共 ' + missDates.length + ' 天' : ''}</div>`
+    : '';
+  return `<div class="section">
+    <h2>每日汇总 <span class="tag">按日期分组 · 红色为漏登记</span></h2>
+    <div class="daily-bar">
+      <span>区间 <b>${first}</b> ～ <b>${endISO}</b>（共 ${all.length} 天）</span>
+      <span>已登记 <b class="ok">${activeDates.length}</b> 天</span>
+      <span>漏登记 <b class="bad">${missDates.length}</b> 天</span>
+      <span>日均业绩 <b>${money(avg)}</b></span>
+      <span>单日最高 <b>${best ? best.date + ' ' + money(best.sales) : '—'}</b></span>
+      <label class="daily-chk"><input type="checkbox" id="dailyMissingOnly" ${dailyOnlyMissing ? 'checked' : ''} /> 只看漏登记</label>
+    </div>
+    ${missTip}
+    <div class="tbl-scroll"><table>
+      <thead><tr><th>日期</th><th>星期</th><th>笔数</th><th>业绩</th><th>提成</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </div>`;
+}
+function refreshDailySummary() {
+  const wrap = document.getElementById('dailySummaryWrap');
+  if (!wrap) return;
+  wrap.innerHTML = dailySummaryHTML(dailyScopeRecords());
+  const cb = document.getElementById('dailyMissingOnly');
+  if (cb) cb.checked = dailyOnlyMissing;
+}
+document.addEventListener('change', e => {
+  if (e.target && e.target.id === 'dailyMissingOnly') {
+    dailyOnlyMissing = !!e.target.checked;
+    refreshDailySummary();
+  }
+});
+
 /* --------------------- 月度提成曲线（SVG） --------------------- */
 function monthlyCommission(records) {
   const map = {};
@@ -759,6 +854,8 @@ function renderBoss() {
 
     ${categoryBreakdownHTML(s.byCategory)}
 
+    <div id="dailySummaryWrap">${dailySummaryHTML(dailyScopeRecords())}</div>
+
     ${isBoss ? `
     <div class="section">
       <h2>区域管理 <span class="tag">老板专属 · 大区架构</span></h2>
@@ -968,6 +1065,8 @@ function renderManager() {
     </div>
 
     ${categoryBreakdownHTML(s.byCategory)}
+
+    <div id="dailySummaryWrap">${dailySummaryHTML(dailyScopeRecords())}</div>
 
     <div class="section">
       <h2>门店人员管理 <span class="tag">店长专属 · 可增减店员</span></h2>
