@@ -263,6 +263,7 @@ function shareLinkHTML() {
     <div class="sc-btns">
       <button class="btn sm" data-action="copy-link">复制链接</button>
       <button class="btn sm ghost" data-action="show-share-qr">生成二维码</button>
+      <button class="btn sm ghost" data-action="diag">数据体检</button>
     </div>
   </div>`;
 }
@@ -698,6 +699,43 @@ function showMemberRecords(memberId) {
   mask.querySelector('#mrClose').onclick = () => mask.remove();
 }
 
+/* 数据同步体检：查看本机数据概况；若本机比线上新，可一键上传合并（按条合并，不会删任何一方的记录） */
+function showDiagPanel() {
+  const info = (DB.getSyncInfo && DB.getSyncInfo()) || {};
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `
+    <div class="modal" style="max-width:580px;">
+      <div class="modal-title">数据同步体检</div>
+      <div class="muted" style="margin:-4px 0 12px;">确认本机数据与线上是否一致。若本机记录比线上多，可一键上传合并。</div>
+      <table class="diag-table"><tbody>
+        <tr><th>门店码（房间）</th><td>${esc(info.room || '—')}</td></tr>
+        <tr><th>本机记录数</th><td><b>${info.recordCount || 0}</b> 条</td></tr>
+        <tr><th>记录日期范围</th><td>${esc((info.firstDate || '—') + ' ～ ' + (info.lastDate || '—'))}</td></tr>
+        <tr><th>最近日期分布</th><td>${esc((info.recentDates || []).join('、') || '—')}</td></tr>
+        <tr><th>会员数</th><td>${info.memberCount || 0} 位</td></tr>
+        <tr><th>数据版本</th><td>v${info.version || 0}</td></tr>
+        <tr><th>状态更新时间</th><td>${info.ts ? new Date(info.ts).toLocaleString('zh-CN') : '—'}</td></tr>
+        <tr><th>实时连接</th><td>${info.connected ? '<span style="color:#067647;">已连接</span>' : '<span style="color:#b54708;">未连接（数据暂无法同步）</span>'}</td></tr>
+      </tbody></table>
+      <div class="sc-warn" style="margin-top:12px;">如果本机记录数<b>多于线上看到的数量</b>，点下方按钮把本机数据上传合并到线上。合并是按条并集，<b>不会删除任何一方的记录</b>。</div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="diagClose">关闭</button>
+        <button class="btn" id="diagPush">上传本机数据到线上</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
+  mask.querySelector('#diagClose').onclick = () => mask.remove();
+  mask.querySelector('#diagPush').onclick = () => {
+    const ok = !!(DB.forcePushLocal && DB.forcePushLocal());
+    const btn = mask.querySelector('#diagPush');
+    if (btn) btn.textContent = ok ? '已上传 ✓' : '未连接，稍后再试';
+    toast(ok ? '本机数据已上传，其他设备刷新后即可看到' : '当前未连接服务器，请检查网络后重试', !ok);
+    if (ok) setTimeout(() => { try { mask.remove(); } catch (e) {} }, 1200);
+  };
+}
+
 /* ----------------------------- 老板 / 区域经理 视图 ----------------------------- */
 function renderBoss() {
   const s = cache.summary;
@@ -1045,6 +1083,10 @@ document.addEventListener('click', async e => {
   }
   if (action === 'show-share-qr') {
     await showShareQR();
+    return;
+  }
+  if (action === 'diag') {
+    showDiagPanel();
     return;
   }
   if (action === 'add-region') {
@@ -1721,6 +1763,8 @@ document.addEventListener('focusout', e => {
     updateLive();
     if (me) render();
     else renderLogin();
+    /* 带 ?diag=1 时直接弹出数据体检，便于在未登录设备上也能查看/抢救本机数据 */
+    if (new URLSearchParams(location.search).get('diag') === '1') setTimeout(showDiagPanel, 300);
   } catch (err) {
     showFatal((err && err.message) || String(err));
   }
