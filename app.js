@@ -624,6 +624,115 @@ document.addEventListener('change', e => {
   }
 });
 
+/* --------------------- 员工与业绩汇总（笔数 / 业绩 / 提成 / 占比） --------------------- */
+let staffSortKey = 'sales';
+const staffExpanded = new Set();
+function staffScopeRecords() {
+  if (me && (me.role === 'boss' || me.role === 'regional')) return rangeFilteredRecords();
+  return cache.records || [];
+}
+function staffSummaryHTML(records) {
+  const head = `<div class="section">
+    <h2>员工与业绩汇总 <span class="tag">按员工分组 · 笔数 / 业绩 / 提成 / 占比</span></h2>`;
+  const recs = (records || []).filter(r => (r.date || '').slice(0, 10));
+  if (!recs.length) return head + `<div class="empty">当前范围内暂无登记记录</div></div>`;
+
+  const by = {};
+  recs.forEach(r => {
+    const key = r.clerkId || ('n:' + (r.clerkName || '未知'));
+    if (!by[key]) by[key] = { id: key, name: r.clerkName || '未知', store: r.storeName || '', count: 0, sales: 0, commission: 0, subs: {} };
+    const s = by[key];
+    s.count++;
+    s.sales += Number(r.amount) || 0;
+    s.commission += Number(r.commission) || 0;
+    if (!s.store && r.storeName) s.store = r.storeName;
+    const sk = (r.category || '其他') + ' / ' + (r.subCategory || '');
+    if (!s.subs[sk]) s.subs[sk] = { count: 0, sales: 0 };
+    s.subs[sk].count++;
+    s.subs[sk].sales += Number(r.amount) || 0;
+  });
+
+  const all = Object.keys(by).map(k => by[k]);
+  const totalSales = all.reduce((a, b) => a + b.sales, 0);
+  const totalComm = all.reduce((a, b) => a + b.commission, 0);
+  const base = totalSales || 1;
+  all.forEach(s => { s.pct = s.sales / base; s.avg = s.count ? s.sales / s.count : 0; });
+  const list = all.slice().sort((a, b) => (Number(b[staffSortKey]) || 0) - (Number(a[staffSortKey]) || 0));
+  const champ = list[0];
+
+  const rows = list.map((s, i) => {
+    let html = `<tr${staffExpanded.has(s.id) ? ' class="staff-open"' : ''}>
+      <td class="staff-name">
+        <button class="staff-toggle" data-action="toggle-staff" data-staff="${esc(s.id)}" title="查看项目构成">${staffExpanded.has(s.id) ? '▾' : '▸'}</button>
+        <span class="staff-rank${i < 3 ? ' top' : ''}">${i + 1}</span>
+        <b>${esc(s.name)}</b>
+      </td>
+      <td>${esc(s.store || '—')}</td>
+      <td>${s.count} 笔</td>
+      <td class="c-amount">${money(s.sales)}</td>
+      <td class="c-comm">${money(s.commission)}</td>
+      <td class="staff-pct">
+        <div class="staff-bar"><span style="width:${(s.pct * 100).toFixed(1)}%"></span></div>
+        <em>${(s.pct * 100).toFixed(1)}%</em>
+      </td>
+      <td class="c-amount">${money(s.avg)}</td>
+    </tr>`;
+    if (staffExpanded.has(s.id)) {
+      const subs = Object.keys(s.subs).map(k => ({ k: k, v: s.subs[k] }))
+        .sort((a, b) => b.v.sales - a.v.sales).slice(0, 10);
+      const subRows = subs.map(x => `<tr>
+        <td>${esc(x.k)}</td><td>${x.v.count} 笔</td>
+        <td class="c-amount">${money(x.v.sales)}</td>
+        <td>${s.sales ? ((x.v.sales / s.sales) * 100).toFixed(1) : '0.0'}%</td>
+      </tr>`).join('');
+      html += `<tr class="staff-detail"><td colspan="7"><div class="staff-detail-box">
+        <div class="sd-title">${esc(s.name)}${s.store ? '（' + esc(s.store) + '）' : ''} 的项目构成 · 共 ${s.count} 笔 / ${money(s.sales)}</div>
+        <table class="sd-table">
+          <thead><tr><th>项目</th><th>笔数</th><th>业绩</th><th>占本人</th></tr></thead>
+          <tbody>${subRows}</tbody>
+        </table>
+      </div></td></tr>`;
+    }
+    return html;
+  }).join('');
+
+  const sortSel = `<select id="staffSortSel" class="staff-sel">
+    <option value="sales"${staffSortKey === 'sales' ? ' selected' : ''}>按业绩排序</option>
+    <option value="count"${staffSortKey === 'count' ? ' selected' : ''}>按笔数排序</option>
+    <option value="commission"${staffSortKey === 'commission' ? ' selected' : ''}>按提成排序</option>
+  </select>`;
+
+  return head + `
+    <div class="daily-bar">
+      <span>参与员工 <b>${list.length}</b> 人</span>
+      <span>总业绩 <b>${money(totalSales)}</b></span>
+      <span>总提成 <b>${money(totalComm)}</b></span>
+      <span>人均业绩 <b>${money(totalSales / (list.length || 1))}</b></span>
+      <span>业绩冠军 <b>${champ ? esc(champ.name) + ' ' + money(champ.sales) : '—'}</b></span>
+      <label class="daily-chk">${sortSel}</label>
+    </div>
+    <div class="tbl-scroll"><table>
+      <thead><tr><th>员工</th><th>门店</th><th>笔数</th><th>业绩</th><th>提成</th><th>业绩占比</th><th>客单价</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </div>`;
+}
+function refreshStaffSummary() {
+  const wrap = document.getElementById('staffSummaryWrap');
+  if (!wrap) return;
+  wrap.innerHTML = staffSummaryHTML(staffScopeRecords());
+}
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-action="toggle-staff"]');
+  if (!btn) return;
+  const id = btn.getAttribute('data-staff');
+  if (staffExpanded.has(id)) staffExpanded.delete(id); else staffExpanded.add(id);
+  refreshStaffSummary();
+});
+document.addEventListener('change', e => {
+  if (e.target && e.target.id === 'staffSortSel') { staffSortKey = e.target.value; refreshStaffSummary(); }
+});
+
 /* --------------------- 月度提成曲线（SVG） --------------------- */
 function monthlyCommission(records) {
   const map = {};
@@ -856,6 +965,8 @@ function renderBoss() {
 
     <div id="dailySummaryWrap">${dailySummaryHTML(dailyScopeRecords())}</div>
 
+    <div id="staffSummaryWrap">${staffSummaryHTML(staffScopeRecords())}</div>
+
     ${isBoss ? `
     <div class="section">
       <h2>区域管理 <span class="tag">老板专属 · 大区架构</span></h2>
@@ -1067,6 +1178,8 @@ function renderManager() {
     ${categoryBreakdownHTML(s.byCategory)}
 
     <div id="dailySummaryWrap">${dailySummaryHTML(dailyScopeRecords())}</div>
+
+    <div id="staffSummaryWrap">${staffSummaryHTML(staffScopeRecords())}</div>
 
     <div class="section">
       <h2>门店人员管理 <span class="tag">店长专属 · 可增减店员</span></h2>
