@@ -14,6 +14,13 @@ window.DB = (function () {
   let client = null;
   let updateCb = null;
 
+  /* ---- 反向覆盖防护（旧设备持旧数据上线会把线上整包盖掉，2026-09-08 事故后加） ---- */
+  let remoteShadow = null;       // 最近一次收到的「线上完整数据」快照（原始，未与本机合并）
+  let remoteShadowVer = 0;       // 该快照对应的版本号
+  let lastGuard = null;          // { missing, ts, healed } 最近一次上传前自检结果
+  let pendingConnectPublish = null; // 连上 broker 后待执行的首次上传（等线上留存到达后再发）
+  let connectPublishTimer = null;
+
   const lsKey = () => 'wb_shop_' + room;
   const lsUserKey = () => 'wb_user_' + room;
 
@@ -184,9 +191,7 @@ window.DB = (function () {
 
   /* ----------------------------- 变更操作（改后 publishState） ----------------------------- */
   function publishState() {
-    state.version = (state.version || 0) + 1;
-    state.ts = Date.now();
-    saveLocal();
+    buildOutgoing();                       // 自检 + 并回线上缺失数据 + 版本递增 + 落盘
     if (client && client.connected) {
       client.publish('shop/' + room + '/state', JSON.stringify(state), { qos: 0, retain: true });
     }
@@ -562,16 +567,53 @@ window.DB = (function () {
     };
     return applyTombstones(merged);
   }
+  /* 上传前自检：本机若缺少线上已有的记录，先并回再上传 —— 绝不用旧数据覆盖他人的新数据。
+     返回「补回条数」；0 表示本机不缺。 */
+  function guardBeforePublish() {
+    if (!state || !state.db || !remoteShadow) return 0;
+    const tomb = (state.db.deleted && state.db.deleted.records) || {};
+    const localIds = new Set((state.db.records || []).map(r => String(r.id)));
+    const missing = (remoteShadow.records || []).filter(r =>
+      r && r.id != null && !localIds.has(String(r.id)) && !tomb[String(r.id)]
+    ).length;
+    if (missing > 0) {
+      state.db = mergeDB(remoteShadow, state.db);   // 以线上为底，把本机缺失的并回来
+      state.ts = Date.now();
+      saveLocal();
+    }
+    if ((remoteShadowVer || 0) > (state.version || 0)) state.version = remoteShadowVer;
+    lastGuard = { missing, ts: Date.now(), healed: missing > 0 };
+    return missing;
+  }
+  function notifySync(msg, isErr) {
+    try { if (typeof window !== 'undefined' && typeof window.__wbSyncToast === 'function') window.__wbSyncToast(msg, !!isErr); } catch (e) {}
+  }
+  /* 生成即将上传的快照（已通过自检，不含被本机误删的线上数据） */
+  function buildOutgoing() {
+    migrateState();
+    const healed = guardBeforePublish();
+    state.version = (state.version || 0) + 1;
+    state.ts = Date.now();
+    saveLocal();
+    if (healed > 0) {
+      notifySync('已自动从线上补回 ' + healed + ' 条记录，未覆盖他人登记的数据', false);
+    }
+    return state;
+  }
   function mergeIncoming(payload) {
     try {
       const inc = JSON.parse(payload);
       if (!inc || !inc.db) return;
       migrateState();
+      remoteShadow = inc.db;                        // 记住线上长什么样，用于上传前自检
+      remoteShadowVer = inc.version || 0;
       state.db = mergeDB(state.db, inc.db);      // 按 id 并集，不再整包覆盖
       state.version = Math.max(state.version || 0, inc.version || 0);
       state.ts = Date.now();
       saveLocal();
       if (updateCb) updateCb();
+      // 线上留存已到，立刻放行连接后的首次上传（此时已是合并后的数据）
+      if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; clearTimeout(connectPublishTimer); f(); }
     } catch (e) {}
   }
   function connectMQTT() {
@@ -580,7 +622,18 @@ window.DB = (function () {
       client = mqtt.connect(BROKER, { clientId: 'wb_' + rand() + Date.now(), clean: true, connectTimeout: 8000, reconnectPeriod: 3000 });
       client.on('connect', () => {
         client.subscribe('shop/' + room + '/state', { qos: 0 });
-        if (state) client.publish('shop/' + room + '/state', JSON.stringify(state), { retain: true }); // 把本地未同步更新推上去
+        /* 关键：不立刻上传。MQTT 的保留消息会在订阅后稍晚送达，
+           若此刻抢先上传本机（可能已落后）的数据，就会把线上整包覆盖 —— 这是 9/8 事故的根因。
+           改为：等线上留存到达（或最多等 3 秒）再上传，且上传前会先并回本机缺失的数据。 */
+        pendingConnectPublish = () => {
+          if (!state) return;
+          buildOutgoing();
+          if (client && client.connected) client.publish('shop/' + room + '/state', JSON.stringify(state), { retain: true });
+          if (updateCb) updateCb();
+        };
+        connectPublishTimer = setTimeout(() => {
+          if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; f(); }
+        }, 3000);
         if (updateCb) updateCb();
       });
       client.on('message', (topic, message) => { if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString()); });
@@ -690,17 +743,26 @@ window.DB = (function () {
       memberCount: mems.length,
       firstDate: dates[0] || '',
       lastDate: dates[dates.length - 1] || '',
-      recentDates: Object.keys(byDate).sort().slice(-7).map(d => d + '(' + byDate[d] + ')')
+      recentDates: Object.keys(byDate).sort().slice(-7).map(d => d + '(' + byDate[d] + ')'),
+      guard: getGuardInfo()
     };
   }
   /* 强制把本机数据推到线上，用于抢救「本机数据比线上新」的情况 */
-  function forcePushLocal() {
+  function forcePushLocal(opts) {
     if (!state) return false;
-    state.version = (state.version || 0) + 1;
-    state.ts = Date.now();
-    saveLocal();
+    buildOutgoing();                       // 同样先自检：本机落后的部分会先从线上补回，不会误伤
     if (client && client.connected) { client.publish('shop/' + room + '/state', JSON.stringify(state), { qos: 0, retain: true }); return true; }
     return false;
+  }
+  /* 供「数据体检」展示：最近一次上传前自检情况 */
+  function getGuardInfo() {
+    return {
+      hasRemote: !!remoteShadow,
+      remoteVer: remoteShadowVer || 0,
+      remoteRecords: (remoteShadow && remoteShadow.records || []).length,
+      healed: lastGuard ? lastGuard.missing : 0,
+      healedAt: lastGuard ? lastGuard.ts : 0
+    };
   }
 
   return {
@@ -709,6 +771,6 @@ window.DB = (function () {
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
-    getSyncInfo, forcePushLocal
+    getSyncInfo, forcePushLocal, getGuardInfo
   };
 })();
