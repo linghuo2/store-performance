@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>正在打开门店业绩工作台…</title>
+<style>
+  body { margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif;
+         background:#f7f9fc; color:#334155; }
+  .box { text-align:center; padding:24px; }
+  .t { font-size:16px; font-weight:600; margin-bottom:10px; }
+  .s { font-size:13px; color:#8892a4; }
+  .bar { margin:14px auto 0; width:120px; height:4px; border-radius:4px; background:#e6eaf1; overflow:hidden; }
+  .bar > i { display:block; width:40%; height:100%; background:#1f4e79; border-radius:4px;
+             animation:mv 1s linear infinite; }
+  @keyframes mv { 0%{transform:translateX(-100%)} 100%{transform:translateX(250%)} }
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="t">正在打开门店业绩工作台…</div>
+  <div class="s" id="tip">正在获取最新版本</div>
+  <div class="bar"><i></i></div>
+</div>
+<script>
+/* 永远进入最新版本：先拉 version.json 拿最新版本号，再跳转到 index.html?...&v=<最新>
+   —— 跳转目标每次都不同，浏览器/CDN 缓存里不可能有，因此必定加载最新版。
+   保留 room / diag 等原有参数；3 秒拿不到版本号也直接进，绝不卡住。 */
+(function () {
+  var params = new URLSearchParams(location.search);
+  if (!params.get('room')) params.set('room', 'shop_mendian');
+  params.delete('v');
+  var target = 'index.html?' + params.toString();
+
+  function go(ver) {
+    var tip = document.getElementById('tip');
+    if (tip) tip.textContent = '正在进入…';
+    location.replace(target + (ver ? '&v=' + encodeURIComponent(ver) : ''));
+  }
+
+  var done = false;
+  var timer = setTimeout(function () { if (!done) { done = true; go(''); } }, 3000);
+  fetch('version.json?_=' + Date.now(), { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { if (done) return; done = true; clearTimeout(timer); go((j && j.ver) || ''); })
+    .catch(function () { if (done) return; done = true; clearTimeout(timer); go(''); });
+})();
+</script>
+</body>
+</html>
