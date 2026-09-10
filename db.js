@@ -7,6 +7,7 @@
  */
 window.DB = (function () {
   const BROKER = 'wss://broker.emqx.io:8084/mqtt';
+  const DEFAULT_ROOM = 'shop_mendian';   // 正式门店码（没带 ?room= 时一律用它，绝不随机）
   const rand = () => Math.random().toString(36).slice(2, 10);
 
   let room = null;
@@ -47,8 +48,12 @@ window.DB = (function () {
   }
   async function seedDB() {
     const d = { regions: [{ id: 'r1', name: '华东大区' }], stores: [], users: [], records: [], members: [], categories: defaultCategories() };
-    d.stores.push({ id: 's1', name: '门店A（旗舰店）', commissionRate: 0.10, commissionFixed: 0, regionId: 'r1' });
-    d.stores.push({ id: 's2', name: '门店B（社区店）', commissionRate: 0.12, commissionFixed: 0, regionId: 'r1' });
+    /* 注意：这里**只建老板账号**，不再塞任何演示店员/店长/区域经理。
+       历史教训（2026-09-10）：旧版会在这里生成「王总/张店长/李店长/小王/小赵/小钱/小孙」
+       等 7 个假账号，一旦有设备落到新房间（或本地缓存被清）重新播种，这些假人就会被
+       合并进真实数据，表现为「突然出现很多无效店员」。新房间必须是干净的。 */
+    d.stores.push({ id: 's1', name: '门店1', commissionRate: 0.10, commissionFixed: 0, regionId: 'r1' });
+    d.stores.push({ id: 's2', name: '门店2', commissionRate: 0.12, commissionFixed: 0, regionId: 'r1' });
     const add = async (username, password, name, role, opts) => {
       opts = opts || {};
       d.users.push({
@@ -57,14 +62,7 @@ window.DB = (function () {
         createdAt: new Date().toISOString()
       });
     };
-    await add('boss', 'boss123', '陈俊杰（老板）', 'boss', {});
-    await add('reg1', 'reg123', '王总（华东区域经理）', 'regional', { regionId: 'r1' });
-    await add('mgrA', 'mgr123', '张店长', 'manager', { storeId: 's1' });
-    await add('mgrB', 'mgr123', '李店长', 'manager', { storeId: 's2' });
-    await add('clerkA1', 'clerk123', '小王', 'clerk', { storeId: 's1' });
-    await add('clerkA2', 'clerk123', '小赵', 'clerk', { storeId: 's1' });
-    await add('clerkB1', 'clerk123', '小钱', 'clerk', { storeId: 's2' });
-    await add('clerkB2', 'clerk123', '小孙', 'clerk', { storeId: 's2' });
+    await add('boss', 'boss123', '老板', 'boss', {});
     return d;
   }
 
@@ -648,9 +646,11 @@ window.DB = (function () {
     try {
       const u = new URL(location.href);
       roomParam = u.searchParams.get('room');
-      if (!roomParam) { room = 'shop_' + rand(); u.searchParams.set('room', room); history.replaceState(null, '', u.toString()); }
-      else room = roomParam;
-    } catch (e) { room = room || 'shop_' + rand(); }
+      /* 绝不随机生成房间：随机房间 = 空数据库 = 一打开就是「数据全没了」+ 满屏演示店员。
+         没带门店码时一律回落到默认正式房间 shop_mendian，并把参数补回地址栏。 */
+      room = roomParam || DEFAULT_ROOM;
+      if (room !== roomParam) { u.searchParams.set('room', room); history.replaceState(null, '', u.toString()); }
+    } catch (e) { room = room || DEFAULT_ROOM; }
     updateCb = cb || null;
     const local = loadLocal();
     if (local && local.db) state = local;
@@ -747,6 +747,71 @@ window.DB = (function () {
       guard: getGuardInfo()
     };
   }
+  /* --------------------- 无效/演示数据扫描与清理 --------------------- */
+  /* 历史遗留：旧版 seedDB 会自动生成 7 个演示账号 + 2 个演示门店名。
+     任何一台设备落到空房间（或缓存被清）重新播种后，这些假人就会被合并进真实数据，
+     表现为「突然出现很多无效店员」。这里提供扫描 + 一键清理（走墓碑，全设备同步生效）。 */
+  const DEMO_USERNAMES = ['reg1', 'mgrA', 'mgrB', 'clerkA1', 'clerkA2', 'clerkB1', 'clerkB2'];
+  const DEMO_NAMES = ['小王', '小赵', '小钱', '小孙', '张店长', '李店长', '王总（华东区域经理）'];
+  const DEMO_STORE_NAMES = ['门店A（旗舰店）', '门店B（社区店）', '门店1', '门店2'];
+  /* 判定依据要写清楚：让用户能自己判断这是不是当初留下的初始账号，而不是盲删。 */
+  function demoReason(u) {
+    const r = [];
+    if (DEMO_USERNAMES.indexOf(u.username) >= 0) r.push('账号名 ' + u.username + ' 是系统初始账号');
+    if (DEMO_NAMES.indexOf(u.name) >= 0) r.push('姓名「' + u.name + '」是系统初始演示人');
+    const lack = ['updatedAt', 'createdAt'].filter(k => !u[k]);
+    if (lack.length) r.push('缺时间戳（老格式数据）');
+    return r.join('；') || '疑似初始账号';
+  }
+  function isDemoUser(u) {
+    if (!u) return false;
+    if (DEMO_USERNAMES.indexOf(u.username) >= 0) return true;
+    if (DEMO_NAMES.indexOf(u.name) >= 0) return true;
+    return false;
+  }
+  /* 扫描：不改动任何数据，只返回分类清单 */
+  function scanJunk() {
+    const users = (state && state.db && state.db.users) || [];
+    const recs = (state && state.db && state.db.records) || [];
+    const cnt = {}; recs.forEach(r => { cnt[r.clerkId] = (cnt[r.clerkId] || 0) + 1; });
+    const demo = [], noRecord = [], dupName = [];
+    const nameMap = {};
+    users.forEach(u => {
+      const isDemo = isDemoUser(u);
+      const n = cnt[u.id] || 0;
+      const item = { id: u.id, name: u.name, username: u.username, role: u.role, records: n, reason: demoReason(u) };
+      if (isDemo) demo.push(item);
+      else if (n === 0) noRecord.push(item);
+      const nm = (u.name || '').trim();
+      if (nm) { nameMap[nm] = (nameMap[nm] || 0) + 1; }
+    });
+    Object.keys(nameMap).forEach(nm => {
+      if (nameMap[nm] > 1) {
+        dupName.push({ name: nm, count: nameMap[nm], ids: users.filter(u => (u.name || '').trim() === nm).map(u => u.id) });
+      }
+    });
+    const staleStore = {};
+    recs.forEach(r => {
+      const s = getStore(r.storeId);
+      if (s && r.storeName && r.storeName !== s.name) staleStore[r.storeName] = (staleStore[r.storeName] || 0) + 1;
+    });
+    const demoStores = (state.db.stores || []).filter(s => DEMO_STORE_NAMES.indexOf(s.name) >= 0).map(s => ({ id: s.id, name: s.name }));
+    return { demo, noRecord, dupName, staleStoreNames: staleStore, demoStores, total: users.length };
+  }
+  /* 清理：按 id 列表打墓碑并 publish（不可逆，调用方必须先让用户确认） */
+  function removeUsersByIds(ids) {
+    const me = getCurrentUser();
+    const set = new Set(ids || []);
+    const before = (state.db.users || []).length;
+    const removed = (state.db.users || []).filter(u => set.has(u.id) && !(me && u.id === me.id) && u.role !== 'boss');
+    const dropIds = new Set(removed.map(u => u.id));
+    state.db.users = (state.db.users || []).filter(u => !dropIds.has(u.id));
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.users = state.db.deleted.users || {};
+    removed.forEach(u => { state.db.deleted.users[u.id] = Date.now(); });
+    publishState();
+    return { ok: true, removed: removed.length, before, after: state.db.users.length, names: removed.map(u => u.name) };
+  }
+
   /* 强制把本机数据推到线上，用于抢救「本机数据比线上新」的情况 */
   function forcePushLocal(opts) {
     if (!state) return false;
@@ -771,6 +836,6 @@ window.DB = (function () {
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
-    getSyncInfo, forcePushLocal, getGuardInfo
+    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds
   };
 })();
