@@ -197,6 +197,7 @@ function render() {
   <div class="topbar">
     <div class="logo">门店业绩<span>工作台</span></div>
     <span class="pill ${me.role}">${roleName(me.role)}</span>
+    ${roomBadgeHTML()}
     <div class="spacer"></div>
     <div class="live" id="liveDot"><span class="dot"></span><span class="txt">实时已连接</span></div>
     <span class="user-name">${esc(me.name)}</span>
@@ -422,6 +423,21 @@ async function exportMembersXLSX() {
 /* --------------------- 支付方式 --------------------- */
 const PAY_METHODS = ['美团', '大众', '微信', '支付宝', '现金', '会员'];
 
+/* 记录的门店名：一律以门店档案为准，不用记录里存的快照。
+   历史遗留：旧设备写入时用到了演示门店名（门店A（旗舰店）/门店B（社区店）），
+   若直接用记录的快照就会显示错误的店名；以 storeId 查表可自动纠正。 */
+function recStoreName(r) {
+  if (!r) return '—';
+  const s = (DB.getStore && DB.getStore(r.storeId)) || null;
+  return (s && s.name) || r.storeName || '—';
+}
+/* --------------------- 门店码徽标（常显，一眼确认有没有进错数据库） --------------------- */
+function roomBadgeHTML() {
+  const room = (DB.getRoom && DB.getRoom()) || '';
+  const isOfficial = room === 'shop_mendian';
+  return `<span class="room-badge ${isOfficial ? 'ok' : 'warn'}" title="门店码＝数据库名。若显示的不是 shop_mendian，说明进错了房间，数据会不对">门店码 ${esc(room)}${isOfficial ? '' : ' ⚠'}</span>`;
+}
+
 /* --------------------- 通用：业绩登记表 --------------------- */
 function recordsTable(records) {
   if (!records.length) return `<div class="empty">暂无业绩记录</div>`;
@@ -430,7 +446,7 @@ function recordsTable(records) {
   const rows = [...records].sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id)).map(r => `
     <tr>
       <td>${esc(r.date)}</td>
-      ${showStore ? `<td>${esc(r.storeName)}</td>` : ''}
+      ${showStore ? `<td>${esc(recStoreName(r))}</td>` : ''}
       ${showClerk ? `<td>${esc(r.clerkName)}</td>` : ''}
       <td>${esc(r.category || '—')}</td>
       <td>${esc(r.subCategory || '—')}</td>
@@ -470,7 +486,7 @@ function editableRecordsTable(records) {
     const optHTML = opts.map(c => `<option value="${esc(c)}" ${c === (r.category || '') ? 'selected' : ''}>${esc(c)}</option>`).join('');
     const storeTd = canReassign
       ? `<td><select class="ed-store" data-rid="${r.id}">${storeOptions(r.storeId)}</select></td>`
-      : (showStore ? `<td>${esc(r.storeName)}</td>` : '');
+      : (showStore ? `<td>${esc(recStoreName(r))}</td>` : '');
     const clerkTd = canReassign
       ? `<td><select class="ed-clerk" data-rid="${r.id}">${clerkOptions(r.storeId, r.clerkId)}</select></td>`
       : (showClerk ? `<td>${esc(r.clerkName)}</td>` : '');
@@ -644,12 +660,12 @@ function staffSummaryHTML(records) {
   const by = {};
   recs.forEach(r => {
     const key = r.clerkId || ('n:' + (r.clerkName || '未知'));
-    if (!by[key]) by[key] = { id: key, name: r.clerkName || '未知', store: r.storeName || '', count: 0, sales: 0, commission: 0, subs: {} };
+    if (!by[key]) by[key] = { id: key, name: r.clerkName || '未知', store: recStoreName(r), count: 0, sales: 0, commission: 0, subs: {} };
     const s = by[key];
     s.count++;
     s.sales += Number(r.amount) || 0;
     s.commission += Number(r.commission) || 0;
-    if (!s.store && r.storeName) s.store = r.storeName;
+    if (!s.store || s.store === '—') s.store = recStoreName(r);
     const sk = (r.category || '其他') + ' / ' + (r.subCategory || '');
     if (!s.subs[sk]) s.subs[sk] = { count: 0, sales: 0 };
     s.subs[sk].count++;
@@ -884,7 +900,7 @@ function showMemberRecords(memberId) {
   const total = recs.reduce((s, r) => s + Number(r.amount || 0), 0);
   const rows = recs.length ? recs.map(r => `<tr>
     <td>${esc(r.date)}</td>
-    <td>${esc(r.storeName || '—')}</td>
+    <td>${esc(recStoreName(r))}</td>
     <td>${esc(r.clerkName || '—')}</td>
     <td>${esc(r.category || '—')}</td>
     <td>${esc(r.subCategory || '—')}</td>
@@ -934,6 +950,7 @@ function showDiagPanel() {
           return `<tr><th>上传前自检</th><td>线上快照 ${g.remoteRecords || 0} 条 / v${g.remoteVer || 0} · ${heal}</td></tr>`;
         })()}
       </tbody></table>
+      ${junkHTML()}
       <div class="sc-warn" style="margin-top:12px;">如果本机记录数<b>多于线上看到的数量</b>，点下方按钮把本机数据上传合并到线上。合并是按条并集，<b>不会删除任何一方的记录</b>；上传前会自动先把线上缺失的记录并回本机，<b>因此也不会覆盖他人的登记</b>。</div>
       <div class="modal-actions">
         <button class="btn ghost" id="diagClose">关闭</button>
@@ -949,6 +966,40 @@ function showDiagPanel() {
     if (btn) btn.textContent = ok ? '已上传 ✓' : '未连接，稍后再试';
     toast(ok ? '本机数据已上传，其他设备刷新后即可看到' : '当前未连接服务器，请检查网络后重试', !ok);
     if (ok) setTimeout(() => { try { mask.remove(); } catch (e) {} }, 1200);
+  };
+  bindJunkActions(mask);
+}
+
+/* 无效/演示数据扫描结果展示 */
+function junkHTML() {
+  if (!DB.scanJunk) return '';
+  let j; try { j = DB.scanJunk(); } catch (e) { return ''; }
+  const has = j.demo.length || j.noRecord.length || j.dupName.length || Object.keys(j.staleStoreNames).length;
+  if (!has) return `<div class="sc-ok" style="margin-top:12px;">数据体检未发现无效项：没有演示账号、没有重复姓名。</div>`;
+  const rows = [];
+  if (j.demo.length) rows.push(`<tr><th>疑似初始账号</th><td><b style="color:#b42318;">${j.demo.length} 个</b>：${j.demo.map(x => esc(x.name + '（' + x.username + '）') + '<span class="muted"> · ' + esc(x.reason) + '</span>').join('<br>')}</td></tr>`);
+  if (j.dupName.length) rows.push(`<tr><th>姓名重复</th><td style="color:#b54708;">${j.dupName.map(x => esc(x.name) + ' ×' + x.count).join('、')}（可能是同一个人被重复建号）</td></tr>`);
+  if (j.noRecord.length) rows.push(`<tr><th>从未登记业绩</th><td>${j.noRecord.length} 个：${j.noRecord.map(x => esc(x.name + '(' + x.username + ')')).join('、')}</td></tr>`);
+  if (Object.keys(j.staleStoreNames).length) rows.push(`<tr><th>店名不一致</th><td>${Object.entries(j.staleStoreNames).map(([k, v]) => esc(k) + ' ' + v + '笔').join('、')}（已自动按门店档案显示，不影响统计）</td></tr>`);
+  let html = `<div style="margin-top:14px;"><div style="font-weight:600;margin-bottom:6px;">发现可疑数据</div>
+    <table class="diag-table"><tbody>${rows.join('')}</tbody></table></div>`;
+  const ids = j.demo.map(x => x.id);
+  if (ids.length) html += `<div class="modal-actions" style="margin-top:10px;"><button class="btn danger" id="junkClean">删除这 ${ids.length} 个疑似初始账号</button></div>
+    <div class="muted" style="font-size:12px;margin-top:6px;">删除前会弹窗列出名单请你二次确认；老板账号和你本人不会被删。删除后可随时重新添加真人。</div>`;
+  return html;
+}
+function bindJunkActions(mask) {
+  const btn = mask.querySelector('#junkClean');
+  if (!btn) return;
+  btn.onclick = () => {
+    const j = DB.scanJunk();
+    const ids = j.demo.map(x => x.id);
+    const names = j.demo.map(x => x.name).join('、');
+    const lines = j.demo.map(x => '· ' + x.name + '（' + x.username + '）—— ' + x.reason);
+    if (!confirm('即将删除以下 ' + ids.length + ' 个账号：\n\n' + lines.join('\n') + '\n\n这些账号从未经手任何业绩登记。\n确定删除？删除后所有设备会自动同步消失（可重新添加真人）。')) return;
+    const r = DB.removeUsersByIds(ids);
+    toast('已删除 ' + (r.removed || 0) + ' 个无效账号，其他设备刷新后同步', false);
+    setTimeout(() => { try { mask.remove(); showDiagPanel(); } catch (e) {} }, 800);
   };
 }
 
