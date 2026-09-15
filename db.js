@@ -161,10 +161,30 @@ window.DB = (function () {
     const u = findUser(id);
     return u && u.active ? publicUser(u) : null;
   }
+  /* 新设备扫码首次打开时，线上数据要等 MQTT 保留消息送达（通常几百毫秒～几秒）。
+     若此时就验证密码，本机还是空/旧数据，必然报「密码错误」。登录前先等一下同步。 */
+  function waitForSync(maxMs) {
+    return new Promise(resolve => {
+      if (remoteShadow) return resolve(true);
+      if (!(client && client.connected)) return resolve(false);   // 根本没连上，别干等
+      const t0 = Date.now(), limit = maxMs || 3000;
+      const iv = setInterval(() => {
+        if (remoteShadow || Date.now() - t0 >= limit) { clearInterval(iv); resolve(!!remoteShadow); }
+      }, 100);
+    });
+  }
   async function login(username, password) {
+    const synced = await waitForSync(3000);
     const u = state.db.users.find(x => x.username === username && x.active);
-    if (!u) return { ok: false, error: '用户名或密码错误' };
-    if (!(await verifyPassword(password, u.password))) return { ok: false, error: '用户名或密码错误' };
+    if (!u) {
+      const known = (state.db.users || []).some(x => x.username === username);
+      if (known) return { ok: false, error: '该账号已停用，请联系店长' };
+      /* 本机压根没这个账号：多半是数据还没同步下来，而不是真的密码错 */
+      return { ok: false, error: synced ? '用户名或密码错误' : '数据同步中，请稍候 5 秒后重试' };
+    }
+    if (!(await verifyPassword(password, u.password))) {
+      return { ok: false, error: synced ? '密码错误' : '数据同步中，请稍候 5 秒后重试' };
+    }
     localStorage.setItem(lsUserKey(), u.id);
     return { ok: true, user: publicUser(u) };
   }
@@ -175,6 +195,10 @@ window.DB = (function () {
     if (!(await verifyPassword(current, u.password))) return { ok: false, error: '当前密码不正确' };
     if (next.length < 6) return { ok: false, error: '新密码至少 6 位' };
     u.password = await hashPassword(next);
+    u.pwdAt = Date.now();                            // 密码专用时间戳，多端合并时永远取最新
+    /* 必须更新 updatedAt：多端合并时同 id 冲突取 updatedAt 较新者，
+       若不更新，其它设备上该用户只要有一条更新时间更晚的旧记录，就会把新密码顶掉。 */
+    u.updatedAt = new Date().toISOString();
     publishState();
     return { ok: true };
   }
@@ -183,6 +207,8 @@ window.DB = (function () {
     if (!u) return { ok: false, error: '人员不存在' };
     if (pw.length < 6) return { ok: false, error: '新密码至少 6 位' };
     u.password = await hashPassword(pw);
+    u.pwdAt = Date.now();                     // 密码专用时间戳，多端合并时永远取最新
+    u.updatedAt = new Date().toISOString();   // 同上：保证新密码在多端合并中胜出
     publishState();
     return { ok: true };
   }
@@ -517,6 +543,25 @@ window.DB = (function () {
     });
     return Array.from(out.values());
   }
+  /* 密码单独保护：用户记录整体按 updatedAt 取新，但密码改用独立的 pwdAt（毫秒时间戳）取新。
+     原因：密码是最敏感也最容易出事的字段。若某台设备时钟偏快、或其用户记录后来被改过名字/门店，
+     它的整条记录 updatedAt 会更晚，就会把老板刚重置的新密码顶回旧密码，表现为「改了密码却登不上」。
+     有了 pwdAt，无论记录主体谁胜出，密码永远取「最后一次改密码」的那一个。 */
+  function mergeUsers(base, inc) {
+    const out = mergeById(base, inc, 'id');
+    const map = new Map();
+    out.forEach(u => { if (u && u.id != null) map.set(String(u.id), u); });
+    const consider = arr => (arr || []).forEach(x => {
+      if (!x || x.id == null) return;
+      const at = Number(x.pwdAt) || 0;
+      if (!at || !x.password) return;
+      const cur = map.get(String(x.id));
+      if (!cur) return;
+      if (at > (Number(cur.pwdAt) || 0)) { cur.password = x.password; cur.pwdAt = at; }
+    });
+    consider(base); consider(inc);
+    return out;
+  }
   function mergeCats(base, inc) {
     const map = new Map();
     (Array.isArray(base) ? base : []).forEach(c => { if (c && c.name != null) map.set(String(c.name), Object.assign({}, c, { subs: (c.subs || []).slice() })); });
@@ -557,7 +602,7 @@ window.DB = (function () {
     const merged = {
       regions: mergeById(b.regions, i.regions, 'id'),
       stores: mergeById(b.stores, i.stores, 'id'),
-      users: mergeById(b.users, i.users, 'id'),
+      users: mergeUsers(b.users, i.users),      // 密码按 pwdAt 单独取新，防止被旧记录顶回
       records: mergeById(b.records, i.records, 'id'),
       members: mergeById(b.members, i.members, 'id'),
       categories: mergeCats(b.categories, i.categories),
