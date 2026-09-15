@@ -118,7 +118,16 @@ function updateLive() {
 /* ----------------------------- 登录 ----------------------------- */
 async function doLogin(username, password) {
   timeRange.mode = 'all'; timeRange.from = ''; timeRange.to = ''; timeRange.month = '';
+  /* 首次打开/新设备扫码时，线上账号数据可能还在同步，先给个提示别让用户以为卡住 */
+  const btn = $('#lgBtn');
+  const oldText = btn ? btn.textContent : '';
+  let tipTimer = null;
+  if (btn) {
+    tipTimer = setTimeout(() => { btn.textContent = '正在同步数据…'; btn.disabled = true; }, 400);
+  }
   const r = await DB.login(username, password);
+  if (tipTimer) clearTimeout(tipTimer);
+  if (btn) { btn.textContent = oldText; btn.disabled = false; }
   if (r.ok) { me = r.user; recomputeCache(); render(); }
   else toast(r.error || '登录失败', true);
 }
@@ -171,15 +180,9 @@ function renderLogin() {
       <label>密码</label>
       <input id="lgPass" type="password" placeholder="请输入密码" autocomplete="current-password" />
       <button class="btn" id="lgBtn">登 录</button>
-      <div class="accounts">
-        <div style="margin-bottom:6px;color:var(--ink);font-weight:600;">演示账号（点击自动填充）</div>
-        <div class="row" data-u="boss" data-p="boss123"><b>老板</b> · boss / boss123（看全部 + 管门店/区域）</div>
-        <div class="row" data-u="reg1" data-p="reg123"><b>区域经理</b> · reg1 / reg123（华东大区范围）</div>
-        <div class="row" data-u="mgrA" data-p="mgr123"><b>店长</b> · mgrA / mgr123（仅本门店 + 管店员）</div>
-        <div class="row" data-u="clerkA1" data-p="clerk123"><b>店员</b> · clerkA1 / clerk123（仅本人业绩/提成）</div>
-      </div>
-      <div class="muted" style="margin-top:12px;font-size:12px;line-height:1.7;">
-        本系统按「门店空间」隔离：请用老板分享的<b>带门店码</b>链接进入（地址栏含 <code>?room=</code>）。同一空间内的老板/店长/店员数据实时同步。
+      <div class="muted" style="margin-top:14px;font-size:12px;line-height:1.8;">
+        本系统按「门店空间」隔离：请用老板分享的<b>带门店码</b>链接进入（地址栏含 <code>?room=</code>）。同一空间内的老板/店长/店员数据实时同步。<br>
+        首次在本机打开时，账号数据需要几秒同步；<b>若提示密码错误，请等 5 秒后重试一次</b>。忘记密码请找老板在「人员管理」里重置。
       </div>
     </div>
   </div>`;
