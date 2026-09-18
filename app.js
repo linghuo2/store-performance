@@ -225,6 +225,108 @@ function exportBarHTML() {
   </div>`;
 }
 
+/* --------------------- 业绩明细筛选（员工 / 日期） --------------------- */
+/* 说明：这里的筛选是明细表专用的，与顶部「经营总览时间筛选」相互独立，
+   避免顶部选了「本月」导致明细里查不到其它日期的记录。 */
+const recFilter = { clerkId: '', from: '', to: '' };
+
+function recStaffOptions() {
+  const storeName = id => { const s = (cache.stores || []).find(x => x.id === id); return s ? s.name : ''; };
+  const roleTag = { clerk: '店员', manager: '店长', regional: '区域经理', boss: '老板' };
+  const users = (cache.users || []).filter(u => u.active !== false);
+  const sorted = users.slice().sort((a, b) => {
+    const w = r => (r === 'clerk' ? 0 : r === 'manager' ? 1 : 2);
+    return w(a.role) - w(b.role) || String(a.name).localeCompare(String(b.name), 'zh-CN');
+  });
+  return sorted.map(u => {
+    const st = storeName(u.storeId);
+    const label = esc(u.name) + (st ? ' · ' + esc(st) : '') +
+      (u.role !== 'clerk' && roleTag[u.role] ? '（' + roleTag[u.role] + '）' : '');
+    return `<option value="${u.id}" ${u.id === recFilter.clerkId ? 'selected' : ''}>${label}</option>`;
+  }).join('');
+}
+
+function recFilterBarHTML(opts) {
+  const withStaff = !(opts && opts.staff === false);
+  const presets = [['today', '今天'], ['yesterday', '昨天'], ['thisMonth', '本月'], ['lastMonth', '上月'], ['all', '全部']];
+  return `<div class="time-bar rec-filter">
+    <span class="tb-label">明细筛选</span>
+    ${withStaff ? `<select id="recFClerk"><option value="">全部员工</option>${recStaffOptions()}</select>` : ''}
+    <input type="date" id="recFFrom" value="${recFilter.from}" title="开始日期" />
+    <span>至</span>
+    <input type="date" id="recFTo" value="${recFilter.to}" title="结束日期" />
+    ${presets.map(([v, t]) => `<button class="btn sm ghost" data-action="recf-preset" data-preset="${v}">${t}</button>`).join('')}
+    <button class="btn sm" data-action="export-filtered">导出筛选结果</button>
+    <span class="muted" style="font-size:12px;">仅作用于下方明细表</span>
+  </div>
+  <div id="recStat"></div>`;
+}
+
+function recFilteredRecords() {
+  const f = recFilter;
+  return (cache.records || []).filter(r => {
+    if (f.clerkId && r.clerkId !== f.clerkId) return false;
+    if (f.from && (r.date || '') < f.from) return false;
+    if (f.to && (r.date || '') > f.to) return false;
+    return true;
+  });
+}
+
+function recStatHTML(recs) {
+  if (!recs.length) return `<div class="rec-stat none">当前筛选条件下没有记录</div>`;
+  const cnt = recs.length;
+  const sales = recs.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  const comm = recs.reduce((a, r) => a + (Number(r.commission) || 0), 0);
+  const avg = cnt ? sales / cnt : 0;
+  return `<div class="rec-stat">共 <b>${cnt}</b> 笔　·　业绩合计 <b>${money(sales)}</b>　·　提成合计 <b>${money(comm)}</b>　·　客单价 <b>${money(avg)}</b></div>`;
+}
+
+/* 只刷新明细表 + 小计，不重建筛选条（避免输入框失焦、筛选状态丢失） */
+function renderRecordViews() {
+  const recs = recFilteredRecords();
+  const stat = $('#recStat');
+  if (stat) stat.innerHTML = recStatHTML(recs);
+  const clerkBox = $('#clerkRecords');
+  if (clerkBox) { clerkBox.innerHTML = recordsTable(recs); return; }
+  const box = $('#bossRecords') || $('#mgrRecords');
+  if (box) box.innerHTML = editableRecordsTable(recs);
+}
+
+function applyRecFilter() {
+  recFilter.clerkId = ($('#recFClerk') && $('#recFClerk').value) || '';
+  recFilter.from = ($('#recFFrom') && $('#recFFrom').value) || '';
+  recFilter.to = ($('#recFTo') && $('#recFTo').value) || '';
+  renderRecordViews();
+}
+function ymdOf(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function monthBoundsOf(yy, mm) {
+  const first = `${yy}-${String(mm + 1).padStart(2, '0')}-01`;
+  const last = new Date(yy, mm + 1, 0);
+  return [first, `${yy}-${String(mm + 1).padStart(2, '0')}-${String(last.getDate()).padStart(2, '0')}`];
+}
+function setRecPreset(p) {
+  const t = new Date();
+  if (p === 'today') { recFilter.from = recFilter.to = ymdOf(t); }
+  else if (p === 'yesterday') { recFilter.from = recFilter.to = ymdOf(new Date(t.getTime() - 86400000)); }
+  else if (p === 'thisMonth') { const [a, b] = monthBoundsOf(t.getFullYear(), t.getMonth()); recFilter.from = a; recFilter.to = b; }
+  else if (p === 'lastMonth') { const [a, b] = monthBoundsOf(t.getFullYear(), t.getMonth() - 1); recFilter.from = a; recFilter.to = b; }
+  else { recFilter.from = ''; recFilter.to = ''; }
+  const fi = $('#recFFrom'), ti = $('#recFTo');
+  if (fi) fi.value = recFilter.from;
+  if (ti) ti.value = recFilter.to;
+  renderRecordViews();
+}
+async function exportFiltered() {
+  const recs = recFilteredRecords();
+  if (!recs.length) return toast('当前筛选没有记录可导出', true);
+  const who = recFilter.clerkId ? ((cache.users || []).find(u => u.id === recFilter.clerkId) || {}).name : '';
+  const span = [recFilter.from, recFilter.to].filter(Boolean).join('至') || '全部日期';
+  try {
+    await DB.exportXLSX(recs, me, (who ? who + '_' : '') + span);
+    toast('已导出当前筛选结果（' + recs.length + ' 笔）');
+  } catch (e) { toast('导出失败', true); }
+}
+
 /* --------------------- 经营总览时间筛选条 --------------------- */
 function timeBarHTML() {
   const presets = [['all', '全部'], ['thisMonth', '本月'], ['lastMonth', '上月'], ['last3', '近3个月'], ['custom', '自定义区间']];
@@ -1066,6 +1168,7 @@ function renderBoss() {
 
     <div class="section">
       <h2>业绩明细管理 <span class="tag">可直接修改大类 / 小类 / 金额 / 归属（实时同步）</span></h2>
+      ${recFilterBarHTML()}
       ${exportBarHTML()}
       <div id="bossRecords"></div>
     </div>
@@ -1151,10 +1254,7 @@ function renderStoreList() {
   }).join('');
 }
 
-function renderBossRecords() {
-  const box = $('#bossRecords');
-  if (box) box.innerHTML = editableRecordsTable(rangeFilteredRecords());
-}
+function renderBossRecords() { renderRecordViews(); }
 
 function renderBossUsers() {
   const box = $('#bossUsers');
@@ -1273,6 +1373,7 @@ function renderManager() {
         <button class="btn" data-action="add-record">+ 登记业绩</button>
       </div>
       <div id="mrCommissionHint" class="commission-hint"></div>
+      ${recFilterBarHTML()}
       <div id="mgrRecords"></div>
     </div>
 
@@ -1300,7 +1401,7 @@ function renderMgrUsers() {
   </tr>`).join('');
   box.innerHTML = `<div class="tbl-scroll"><table><thead><tr><th>店员姓名</th><th>账号</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
-function renderMgrRecords() { const box = $('#mgrRecords'); if (box) box.innerHTML = editableRecordsTable(cache.records); }
+function renderMgrRecords() { renderRecordViews(); }
 
 /* ----------------------------- 店员视图 ----------------------------- */
 function renderClerk() {
@@ -1331,11 +1432,11 @@ function renderClerk() {
         <button class="btn" data-action="add-record">+ 登记业绩</button>
       </div>
       <div id="crCommissionHint" class="commission-hint"></div>
+      ${recFilterBarHTML({ staff: false })}
       <div id="clerkRecords"></div>
     </div>`;
-  const box = $('#clerkRecords');
-  if (box) box.innerHTML = recordsTable(cache.records);
   bindMemberToggle('crPay', 'crMemberRow', 'crMember', 'crSub', 'crCat', 'crAmount');
+  renderRecordViews();
 }
 
 /* ----------------------------- 行为处理（事件委托） ----------------------------- */
@@ -1348,6 +1449,14 @@ document.addEventListener('click', async e => {
   if (action === 'export-xlsx') {
     const m = $('#expMonth') ? $('#expMonth').value : '';
     await exportXLSX(m);
+    return;
+  }
+  if (action === 'export-filtered') {
+    await exportFiltered();
+    return;
+  }
+  if (action === 'recf-preset') {
+    setRecPreset(btn.dataset.preset);
     return;
   }
   if (action === 'export-members') {
@@ -1882,6 +1991,10 @@ document.addEventListener('focusout', e => {
     const active = document.activeElement;
     if (dropdown && active !== input && !dropdown.contains(active)) dropdown.classList.remove('open');
   }, 120);
+});
+/* 业绩明细筛选：员工下拉 / 起止日期变更 */
+document.addEventListener('change', e => {
+  if (e.target.closest('#recFClerk, #recFFrom, #recFTo')) applyRecFilter();
 });
 document.addEventListener('change', e => {
   const sub = e.target.closest('#crSub, #mrSub');
