@@ -256,6 +256,7 @@ function recFilterBarHTML(opts) {
     <span>至</span>
     <input type="date" id="recFTo" value="${recFilter.to}" title="结束日期" />
     ${presets.map(([v, t]) => `<button class="btn sm ghost" data-action="recf-preset" data-preset="${v}">${t}</button>`).join('')}
+    ${withStaff ? `<button class="btn sm warn" data-action="save-all-records">💾 保存全部改动</button>` : ''}
     <button class="btn sm" data-action="export-filtered">导出筛选结果</button>
     <span class="muted" style="font-size:12px;">仅作用于下方明细表</span>
   </div>
@@ -528,6 +529,29 @@ async function exportMembersXLSX() {
 /* --------------------- 支付方式 --------------------- */
 const PAY_METHODS = ['美团', '大众', '微信', '支付宝', '现金', '会员'];
 
+/* 登记表单「控件组」：按 id 前缀索引，新增角色表单只要沿用同样的后缀即可自动复用
+   小类联想 / 金额自动带价 / 提成试算等全部交互，无需再到处改事件监听。
+   后缀：Cat=大类 Sub=小类 Amount=金额 Pay=支付方式 CommissionHint=提成提示 */
+const EDIT_GROUPS = {
+  cr: { cat: 'crCat', sub: 'crSub', amt: 'crAmount', pay: 'crPay', hint: 'crCommissionHint' },
+  mr: { cat: 'mrCat', sub: 'mrSub', amt: 'mrAmount', pay: 'mrPay', hint: 'mrCommissionHint' },
+  br: { cat: 'brCat', sub: 'brSub', amt: 'brAmount', pay: 'brPay', hint: 'brCommissionHint' }
+};
+function editGroupOf(id) {
+  const pfx = String(id || '').replace(/(Cat|Sub|Amount|Pay|CommissionHint)$/, '');
+  return EDIT_GROUPS[pfx] || null;
+}
+/* 取「小类搜索框」上下文（排除支付方式 / 会员两种同名搜索框） */
+function subCtxOf(el) {
+  const input = el && el.closest ? el.closest('.sub-search-input') : null;
+  if (!input) return null;
+  const wrap = input.closest('.sub-search');
+  if (!wrap || wrap.classList.contains('pay-search') || wrap.classList.contains('member-search')) return null;
+  const cfg = editGroupOf(input.id);
+  if (!cfg) return null;
+  return { input, wrap, dropdown: wrap.querySelector('.sub-search-dropdown'), cfg };
+}
+
 /* 记录的门店名：一律以门店档案为准，不用记录里存的快照。
    历史遗留：旧设备写入时用到了演示门店名（门店A（旗舰店）/门店B（社区店）），
    若直接用记录的快照就会显示错误的店名；以 storeId 查表可自动纠正。 */
@@ -576,16 +600,37 @@ function recordsTable(records) {
   </div>`;
 }
 
+/* 归属门店 / 店员下拉项：务必包含该记录当前的归属，
+   否则店员被停用或调店后就查不到，下拉会默认选中第一项，一保存就把业绩改挂到别人名下。 */
+function storeOptionList(sel) {
+  let list = cache.stores.slice();
+  if (sel && !list.some(s => s.id === sel)) {
+    let own = null;
+    try { own = DB.getStore && DB.getStore(sel); } catch (e) {}
+    if (own) list = [own].concat(list);
+    else list = [{ id: sel, name: '原门店（已删除）' }].concat(list);
+  }
+  return list.map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+}
+function clerkOptionList(storeId, sel, fallbackName) {
+  let list = (cache.users || []).filter(u => u.role === 'clerk' && u.active !== false && u.storeId === storeId);
+  if (sel && !list.some(u => u.id === sel)) {
+    const own = (cache.users || []).find(u => u.id === sel);
+    const item = own ? own : { id: sel, name: (fallbackName || '未知店员') + '（已停用/已调店）' };
+    list = [item].concat(list);
+  }
+  return list.map(u => `<option value="${u.id}" ${u.id === sel ? 'selected' : ''}>${esc(u.name)}</option>`).join('');
+}
+
 /* --------------------- 可编辑业绩明细表 --------------------- */
 function editableRecordsTable(records) {
   if (!records.length) return `<div class="empty">暂无业绩记录</div>`;
   const showStore = (me.role === 'boss' || me.role === 'regional');
   const showClerk = (me.role !== 'clerk');
   const canReassign = (me.role === 'boss' || me.role === 'regional');
-  const storeOptions = (sel) => cache.stores.map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
-  const clerkOptions = (storeId, sel) => cache.users
-    .filter(u => u.role === 'clerk' && u.active && u.storeId === storeId)
-    .map(u => `<option value="${u.id}" ${u.id === sel ? 'selected' : ''}>${esc(u.name)}</option>`).join('');
+  const canEditAll = (me.role === 'boss' || me.role === 'regional' || me.role === 'manager');
+  const storeOptions = (sel) => storeOptionList(sel);
+  const clerkOptions = (storeId, sel, fallbackName) => clerkOptionList(storeId, sel, fallbackName);
   const rows = [...records].sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id)).map(r => {
     const opts = Array.from(new Set([...(r.category ? [r.category] : []), ...(cache.categories || []).map(c => c.name)]));
     const optHTML = opts.map(c => `<option value="${esc(c)}" ${c === (r.category || '') ? 'selected' : ''}>${esc(c)}</option>`).join('');
@@ -593,17 +638,21 @@ function editableRecordsTable(records) {
       ? `<td><select class="ed-store" data-rid="${r.id}">${storeOptions(r.storeId)}</select></td>`
       : (showStore ? `<td>${esc(recStoreName(r))}</td>` : '');
     const clerkTd = canReassign
-      ? `<td><select class="ed-clerk" data-rid="${r.id}">${clerkOptions(r.storeId, r.clerkId)}</select></td>`
+      ? `<td><select class="ed-clerk" data-rid="${r.id}">${clerkOptions(r.storeId, r.clerkId, r.clerkName)}</select></td>`
       : (showClerk ? `<td>${esc(r.clerkName)}</td>` : '');
+    /* 日期可改：登记时填错日期是最常见的返工场景 */
+    const dateTd = canEditAll
+      ? `<td><input class="ed-date" data-rid="${r.id}" type="date" value="${esc(r.date)}" style="width:140px;" /></td>`
+      : `<td>${esc(r.date)}</td>`;
     return `<tr data-rid="${r.id}">
-      <td>${esc(r.date)}</td>
+      ${dateTd}
       ${storeTd}
       ${clerkTd}
       <td><select class="ed-cat" data-rid="${r.id}">${optHTML}</select></td>
       <td><input class="ed-sub" data-rid="${r.id}" list="subList" value="${esc(r.subCategory || '')}" placeholder="小类" /></td>
       <td><input class="ed-pay" data-rid="${r.id}" list="payList" value="${esc(r.payMethod || '')}" placeholder="支付方式" style="width:120px;" /></td>
       <td><input class="ed-amt" data-rid="${r.id}" type="number" step="0.01" value="${r.amount}" style="width:104px;" /></td>
-      <td class="c-comm">${money(r.commission)}</td>
+      <td class="c-comm" title="提成由业绩金额 × 门店/项目费率自动计算，保存时自动重算">${money(r.commission)}</td>
       <td><input class="ed-note" data-rid="${r.id}" value="${esc(r.note || '')}" placeholder="备注" style="width:120px;" /></td>
       <td>
         <button class="btn sm" data-action="save-record" data-id="${r.id}">保存</button>
@@ -621,6 +670,71 @@ function editableRecordsTable(records) {
     </table>
   </div>`;
 }
+
+/* --------------------- 明细行保存（单条 / 批量） --------------------- */
+function markDirty(el) {
+  const tr = el && el.closest ? el.closest('tr[data-rid]') : null;
+  if (tr) tr.classList.add('dirty');
+}
+/* 改了归属门店后，店员下拉必须跟着换，否则会把业绩挂到别的店的人头上 */
+function refreshClerkOptions(storeSel) {
+  const rid = storeSel.dataset.rid;
+  const clerkSel = document.querySelector('.ed-clerk[data-rid="' + rid + '"]');
+  if (!clerkSel) return;
+  clerkSel.innerHTML = clerkOptionList(storeSel.value, '', '');
+  markDirty(storeSel);
+}
+async function saveOneRecord(rid) {
+  const q = sel => document.querySelector(sel + '[data-rid="' + rid + '"]');
+  const catEl = q('.ed-cat');
+  if (!catEl) return { ok: false, error: '该行已不存在，请刷新页面' };
+  const amtEl = q('.ed-amt'), subEl = q('.ed-sub'), noteEl = q('.ed-note');
+  const payEl = q('.ed-pay'), dateEl = q('.ed-date');
+  const amt = parseFloat(amtEl ? amtEl.value : '');
+  if (!(amt >= 0)) return { ok: false, error: '请输入有效金额' };
+  const body = {
+    category: catEl.value,
+    subCategory: subEl ? (subEl.value || '').trim() : '',
+    amount: amt,
+    note: noteEl ? (noteEl.value || '').trim() : '',
+    payMethod: payEl ? payEl.value : ''
+  };
+  if (dateEl) {
+    const d = (dateEl.value || '').trim();
+    if (!d) return { ok: false, error: '请选择日期' };
+    body.date = d;
+  }
+  if (me.role === 'boss' || me.role === 'regional') {
+    const storeSel = q('.ed-store'), clerkSel = q('.ed-clerk');
+    if (storeSel) body.storeId = storeSel.value;
+    if (clerkSel) body.clerkId = clerkSel.value;
+  }
+  const r = await DB.updateRecord(rid, body);
+  if (r.ok) {
+    const tr = document.querySelector('tr[data-rid="' + rid + '"]');
+    if (tr) tr.classList.remove('dirty');
+  }
+  return r;
+}
+async function saveAllRecords() {
+  const rows = Array.from(document.querySelectorAll('#bossRecords tr.dirty, #mgrRecords tr.dirty'));
+  if (!rows.length) return toast('当前没有未保存的改动');
+  let ok = 0, err = 0, errMsg = '';
+  for (const tr of rows) {
+    const r = await saveOneRecord(tr.dataset.rid);
+    if (r.ok) ok++; else { err++; errMsg = r.error || '保存失败'; }
+  }
+  recomputeCache(); render();
+  toast(err ? (ok + ' 条已保存，' + err + ' 条失败：' + errMsg) : ('已保存 ' + ok + ' 条改动（提成已自动重算）'), err > 0);
+}
+document.addEventListener('input', e => {
+  if (e.target.closest('.ed-date, .ed-sub, .ed-pay, .ed-amt, .ed-note')) markDirty(e.target);
+});
+document.addEventListener('change', e => {
+  if (e.target.closest('.ed-cat, .ed-clerk, .ed-amt, .ed-date')) markDirty(e.target);
+  const st = e.target.closest('.ed-store');
+  if (st) refreshClerkOptions(st);
+});
 
 /* --------------------- 项目构成汇总表 --------------------- */
 function categoryBreakdownHTML(byCategory) {
@@ -1167,7 +1281,8 @@ function renderBoss() {
     </div>
 
     <div class="section">
-      <h2>业绩明细管理 <span class="tag">可直接修改大类 / 小类 / 金额 / 归属（实时同步）</span></h2>
+      <h2>业绩明细管理 <span class="tag">可直接修改日期 / 归属 / 大类 / 金额（实时同步）</span></h2>
+      ${bossAddRecordHTML()}
       ${recFilterBarHTML()}
       ${exportBarHTML()}
       <div id="bossRecords"></div>
@@ -1193,6 +1308,7 @@ function renderBoss() {
   if (isBoss) { renderRegionList(); renderCategories(); }
   renderStoreList();
   renderBossRecords();
+  bindBossAddForm();
   renderBossUsers();
   const sel = $('#nuStore');
   sel.innerHTML = cache.stores.map(st => `<option value="${st.id}">${esc(st.name)}</option>`).join('');
@@ -1254,6 +1370,35 @@ function renderStoreList() {
   }).join('');
 }
 
+/* 老板 / 区域经理：在业绩明细页直接补录业绩（以前只有店长、店员能登记） */
+function bossAddRecordHTML() {
+  if (!(me.role === 'boss' || me.role === 'regional')) return '';
+  return `<div class="row-actions" style="margin-bottom:12px;align-items:flex-end;">
+      <div class="field"><label>日期</label><input id="brDate" type="date" value="${today()}" /></div>
+      <div class="field"><label>归属门店</label><select id="brStore"></select></div>
+      <div class="field"><label>归属店员</label><select id="brClerk"></select></div>
+      <div class="field"><label>大类</label><select id="brCat">${catOptionsHTML()}</select></div>
+      <div class="field" style="position:relative;"><label>小类</label><div class="sub-search"><input id="brSub" class="sub-search-input" placeholder="搜索或选择小类" autocomplete="off" /><div id="brSubDropdown" class="sub-search-dropdown"></div></div></div>
+      <div class="field"><label>业绩金额</label><input id="brAmount" type="number" step="0.01" placeholder="0.00" style="width:130px;" /></div>
+      <div class="field"><label>支付方式</label><div class="sub-search pay-search" id="brPayWrap"><input id="brPay" class="sub-search-input" placeholder="搜索或选择支付方式" autocomplete="off" /><div id="brPayDropdown" class="sub-search-dropdown"></div></div></div>
+      <div class="field" id="brMemberRow" style="display:none;position:relative;"><label>会员（储值）</label><div class="sub-search member-search" id="brMemberWrap"><input id="brMemberInput" class="sub-search-input" placeholder="搜索会员姓名/手机号" autocomplete="off" /><div id="brMemberDropdown" class="sub-search-dropdown"></div></div><input type="hidden" id="brMember" /></div>
+      <div class="field"><label>备注</label><input id="brNote" placeholder="选填" /></div>
+      <button class="btn" data-action="add-record">+ 登记业绩</button>
+    </div>
+    <div id="brCommissionHint" class="commission-hint"></div>`;
+}
+function bindBossAddForm() {
+  const st = $('#brStore');
+  if (!st) return;
+  st.innerHTML = storeOptionList('');
+  const fillClerk = () => {
+    const c = $('#brClerk');
+    if (c) c.innerHTML = clerkOptionList(st.value, '', '');
+  };
+  fillClerk();
+  st.addEventListener('change', fillClerk);
+  bindMemberToggle('brPay', 'brMemberRow', 'brMember', 'brSub', 'brCat', 'brAmount');
+}
 function renderBossRecords() { renderRecordViews(); }
 
 function renderBossUsers() {
@@ -1584,6 +1729,12 @@ document.addEventListener('click', async e => {
       body = { clerkId: $('#mrClerk').value, date: $('#mrDate').value, category: $('#mrCat').value, subCategory: $('#mrSub').value.trim(), payMethod: $('#mrPay').value, amount: parseFloat($('#mrAmount').value), note: $('#mrNote').value };
       if ($('#mrPay').value === '会员') body.memberId = $('#mrMember').value;
     }
+    else if (me.role === 'boss' || me.role === 'regional') {
+      const clerk = $('#brClerk') ? $('#brClerk').value : '';
+      if (!clerk) return toast('请选择归属店员', true);
+      body = { storeId: $('#brStore').value, clerkId: clerk, date: $('#brDate').value, category: $('#brCat').value, subCategory: $('#brSub').value.trim(), payMethod: $('#brPay').value, amount: parseFloat($('#brAmount').value), note: $('#brNote').value };
+      if ($('#brPay').value === '会员') body.memberId = $('#brMember').value;
+    }
     else return;
     if (!(body.amount >= 0)) return toast('请输入有效金额', true);
     const r = await DB.addRecord(body);
@@ -1592,6 +1743,11 @@ document.addEventListener('click', async e => {
       if (me.role === 'clerk') { renderClerk(); }
       else if (me.role === 'manager') { renderMgrRecords(); }
       else { renderBossRecords(); }
+      if (me.role === 'boss' || me.role === 'regional') {
+        const a = $('#brAmount'); if (a) a.value = '';
+        const s = $('#brSub'); if (s) s.value = '';
+        const n = $('#brNote'); if (n) n.value = '';
+      }
       toast('业绩已登记');
     } else toast(r.error || '登记失败', true);
   }
@@ -1647,23 +1803,14 @@ document.addEventListener('click', async e => {
     else toast(r.error || '删除失败', true);
   }
   else if (action === 'save-record') {
-    const rid = id;
-    const cat = document.querySelector('.ed-cat[data-rid="' + rid + '"]').value;
-    const sub = (document.querySelector('.ed-sub[data-rid="' + rid + '"]').value || '').trim();
-    const amt = parseFloat(document.querySelector('.ed-amt[data-rid="' + rid + '"]').value);
-    const note = (document.querySelector('.ed-note[data-rid="' + rid + '"]').value || '').trim();
-    const paySel = document.querySelector('.ed-pay[data-rid="' + rid + '"]');
-    if (!(amt >= 0)) return toast('请输入有效金额', true);
-    const body = { category: cat, subCategory: sub, amount: amt, note, payMethod: paySel ? paySel.value : '' };
-    if (me.role === 'boss' || me.role === 'regional') {
-      const storeSel = document.querySelector('.ed-store[data-rid="' + rid + '"]');
-      const clerkSel = document.querySelector('.ed-clerk[data-rid="' + rid + '"]');
-      if (storeSel) body.storeId = storeSel.value;
-      if (clerkSel) body.clerkId = clerkSel.value;
-    }
-    const r = await DB.updateRecord(rid, body);
-    if (r.ok) { recomputeCache(); render(); toast('已保存'); }
+    const r = await saveOneRecord(id);
+    if (r.ok) { recomputeCache(); render(); toast('已保存（提成已自动重算）'); }
     else toast(r.error || '保存失败', true);
+    return;
+  }
+  else if (action === 'save-all-records') {
+    await saveAllRecords();
+    return;
   }
   else if (action === 'add-cat') {
     const name = $('#ncName').value.trim();
@@ -1878,7 +2025,11 @@ function updateCommissionHint(catSelId, subInputId, amtId, hintId, storeId) {
 function getCurrentStoreId() {
   if (me.role === 'clerk') return me.storeId;
   if (me.role === 'manager') { const st = cache.stores[0]; return st ? st.id : null; }
-  return null;
+  /* 老板 / 区域经理：以补录表单里选的门店为准 */
+  const bs = document.getElementById('brStore');
+  if (bs && bs.value) return bs.value;
+  const st2 = cache.stores[0];
+  return st2 ? st2.id : null;
 }
 /* 小类搜索下拉 */
 function getSubItems(catName) {
@@ -1926,31 +2077,25 @@ function applySubSelection(inputId, catSelId, amtId, hintId, storeId, name, cate
   autoFillPriceFromSub(input, catSelId, amtId, true);
   updateCommissionHint(catSelId, inputId, amtId, hintId, storeId);
 }
-function ensureSubDropdownOpen(inputId, dropdownId, catSelId, filter) {
+function ensureSubDropdownOpen(inputId, dropdownRef, catSelId, filter) {
   const input = document.getElementById(inputId);
-  const dropdown = document.getElementById(dropdownId);
+  const dropdown = (typeof dropdownRef === 'string') ? document.getElementById(dropdownRef) : dropdownRef;
   const cat = document.getElementById(catSelId);
   if (!input || !dropdown) return;
   renderSubDropdown(dropdown, cat ? cat.value : '', filter);
   dropdown.classList.add('open');
 }
 document.addEventListener('focusin', e => {
-  const input = e.target.closest('#crSub, #mrSub');
-  if (!input) return;
-  if (input.id === 'crSub') ensureSubDropdownOpen('crSub', 'crSubDropdown', 'crCat', '');
-  else ensureSubDropdownOpen('mrSub', 'mrSubDropdown', 'mrCat', '');
+  const c = subCtxOf(e.target);
+  if (c) ensureSubDropdownOpen(c.input.id, c.dropdown, c.cfg.cat, '');
 });
 document.addEventListener('click', e => {
-  const input = e.target.closest('#crSub, #mrSub');
-  if (!input) return;
-  if (input.id === 'crSub') ensureSubDropdownOpen('crSub', 'crSubDropdown', 'crCat', '');
-  else ensureSubDropdownOpen('mrSub', 'mrSubDropdown', 'mrCat', '');
+  const c = subCtxOf(e.target);
+  if (c) ensureSubDropdownOpen(c.input.id, c.dropdown, c.cfg.cat, '');
 });
 document.addEventListener('input', e => {
-  const input = e.target.closest('#crSub, #mrSub');
-  if (!input) return;
-  if (input.id === 'crSub') ensureSubDropdownOpen('crSub', 'crSubDropdown', 'crCat', input.value);
-  else ensureSubDropdownOpen('mrSub', 'mrSubDropdown', 'mrCat', input.value);
+  const c = subCtxOf(e.target);
+  if (c) ensureSubDropdownOpen(c.input.id, c.dropdown, c.cfg.cat, c.input.value);
 });
 document.addEventListener('mousedown', e => {
   const item = e.target.closest('.sub-search-item');
@@ -1958,38 +2103,33 @@ document.addEventListener('mousedown', e => {
     const wrap = item.closest('.sub-search');
     const input = wrap ? wrap.querySelector('.sub-search-input') : null;
     if (!input) return;
+    const g = editGroupOf(input.id);
     const name = item.dataset.name;
     const category = item.dataset.category;
-    if (input.id === 'crSub') applySubSelection('crSub', 'crCat', 'crAmount', 'crCommissionHint', getCurrentStoreId(), name, category);
-    else applySubSelection('mrSub', 'mrCat', 'mrAmount', 'mrCommissionHint', getCurrentStoreId(), name, category);
+    if (g) applySubSelection(input.id, g.cat, g.amt, g.hint, getCurrentStoreId(), name, category);
     e.preventDefault();
     return;
   }
-  if (!e.target.closest('.sub-search')) {
-    closeSubDropdown('crSubDropdown');
-    closeSubDropdown('mrSubDropdown');
-  }
+  if (!e.target.closest('.sub-search')) closeAllDropdowns();
 });
+function closeAllDropdowns() {
+  document.querySelectorAll('.sub-search-dropdown.open').forEach(d => d.classList.remove('open'));
+}
 document.addEventListener('keydown', e => {
-  const input = e.target.closest('#crSub, #mrSub');
-  if (!input) return;
-  const dropdownId = input.id === 'crSub' ? 'crSubDropdown' : 'mrSubDropdown';
-  const dropdown = document.getElementById(dropdownId);
-  if (e.key === 'Escape') { if (dropdown) dropdown.classList.remove('open'); return; }
+  const c = subCtxOf(e.target);
+  if (!c) return;
+  if (e.key === 'Escape') { if (c.dropdown) c.dropdown.classList.remove('open'); return; }
   if (e.key === 'ArrowDown') {
     e.preventDefault();
-    ensureSubDropdownOpen(input.id, dropdownId, input.id === 'crSub' ? 'crCat' : 'mrCat', '');
-    return;
+    ensureSubDropdownOpen(c.input.id, c.dropdown, c.cfg.cat, '');
   }
 });
 document.addEventListener('focusout', e => {
-  const input = e.target.closest('#crSub, #mrSub');
-  if (!input) return;
-  const dropdownId = input.id === 'crSub' ? 'crSubDropdown' : 'mrSubDropdown';
+  const c = subCtxOf(e.target);
+  if (!c) return;
   setTimeout(() => {
-    const dropdown = document.getElementById(dropdownId);
     const active = document.activeElement;
-    if (dropdown && active !== input && !dropdown.contains(active)) dropdown.classList.remove('open');
+    if (c.dropdown && active !== c.input && !c.dropdown.contains(active)) c.dropdown.classList.remove('open');
   }, 120);
 });
 /* 业绩明细筛选：员工下拉 / 起止日期变更 */
@@ -1997,31 +2137,22 @@ document.addEventListener('change', e => {
   if (e.target.closest('#recFClerk, #recFFrom, #recFTo')) applyRecFilter();
 });
 document.addEventListener('change', e => {
-  const sub = e.target.closest('#crSub, #mrSub');
-  if (sub) {
-    if (sub.id === 'crSub') autoFillPriceFromSub(sub, 'crCat', 'crAmount');
-    else autoFillPriceFromSub(sub, 'mrCat', 'mrAmount');
-    updateCommissionHint('crCat', 'crSub', 'crAmount', 'crCommissionHint', getCurrentStoreId());
-    updateCommissionHint('mrCat', 'mrSub', 'mrAmount', 'mrCommissionHint', getCurrentStoreId());
-  }
-  if (e.target.closest('#crAmount, #mrAmount')) {
-    updateCommissionHint('crCat', 'crSub', 'crAmount', 'crCommissionHint', getCurrentStoreId());
-    updateCommissionHint('mrCat', 'mrSub', 'mrAmount', 'mrCommissionHint', getCurrentStoreId());
-  }
-  if (e.target.closest('#crCat, #mrCat')) {
-    const isCr = e.target.id === 'crCat';
-    const subInput = document.getElementById(isCr ? 'crSub' : 'mrSub');
+  const g = editGroupOf(e.target.id);
+  if (!g) return;
+  const fn = () => updateCommissionHint(g.cat, g.sub, g.amt, g.hint, getCurrentStoreId());
+  if (e.target.id === g.sub) { autoFillPriceFromSub(e.target, g.cat, g.amt); fn(); }
+  else if (e.target.id === g.amt) fn();
+  else if (e.target.id === g.cat) {
+    const subInput = document.getElementById(g.sub);
     if (subInput) subInput.value = '';
-    closeSubDropdown(isCr ? 'crSubDropdown' : 'mrSubDropdown');
-    updateCommissionHint('crCat', 'crSub', 'crAmount', 'crCommissionHint', getCurrentStoreId());
-    updateCommissionHint('mrCat', 'mrSub', 'mrAmount', 'mrCommissionHint', getCurrentStoreId());
+    const dd = subInput && subInput.closest('.sub-search');
+    if (dd) { const d = dd.querySelector('.sub-search-dropdown'); if (d) d.classList.remove('open'); }
+    fn();
   }
 });
 document.addEventListener('input', e => {
-  if (e.target.closest('#crAmount, #mrAmount')) {
-    updateCommissionHint('crCat', 'crSub', 'crAmount', 'crCommissionHint', getCurrentStoreId());
-    updateCommissionHint('mrCat', 'mrSub', 'mrAmount', 'mrCommissionHint', getCurrentStoreId());
-  }
+  const g = editGroupOf(e.target.id);
+  if (g && e.target.id === g.amt) updateCommissionHint(g.cat, g.sub, g.amt, g.hint, getCurrentStoreId());
 });
 document.addEventListener('keydown', e => {
   const addInp = e.target.closest('.sub-input');
@@ -2047,42 +2178,35 @@ function renderPayDropdown(dropdown, filter) {
   if (!items.length) { dropdown.innerHTML = '<div class="pay-search-empty">无匹配支付方式</div>'; return; }
   dropdown.innerHTML = items.map(p => `<div class="pay-search-item" data-name="${esc(p)}">${esc(p)}</div>`).join('');
 }
-function ensurePayDropdownOpen(inputId, dropdownId, filter) {
-  const input = document.getElementById(inputId);
-  const dropdown = document.getElementById(dropdownId);
+function payDropdownOf(input) {
+  const wrap = input && input.closest ? input.closest('.pay-search') : null;
+  return wrap ? wrap.querySelector('.sub-search-dropdown') : null;
+}
+function ensurePayDropdownOpenFor(input, filter) {
+  const dropdown = payDropdownOf(input);
   if (!input || !dropdown) return;
   renderPayDropdown(dropdown, filter);
   dropdown.classList.add('open');
 }
-function applyPaySelection(inputId, name) {
-  const input = document.getElementById(inputId);
+function applyPaySelection(input, name) {
   if (!input) return;
   input.value = name;
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.dispatchEvent(new Event('change', { bubbles: true }));
-  closePayDropdown(inputId === 'crPay' ? 'crPayDropdown' : 'mrPayDropdown');
-}
-function closePayDropdown(dropdownId) {
-  const dropdown = document.getElementById(dropdownId);
-  if (dropdown) dropdown.classList.remove('open');
+  const dd = payDropdownOf(input);
+  if (dd) dd.classList.remove('open');
 }
 document.addEventListener('focusin', e => {
-  const input = e.target.closest('#crPay, #mrPay');
-  if (!input) return;
-  const dropdownId = input.id === 'crPay' ? 'crPayDropdown' : 'mrPayDropdown';
-  ensurePayDropdownOpen(input.id, dropdownId, '');
+  const input = e.target.closest('.pay-search .sub-search-input');
+  if (input) ensurePayDropdownOpenFor(input, '');
 });
 document.addEventListener('click', e => {
-  const input = e.target.closest('#crPay, #mrPay');
-  if (!input) return;
-  const dropdownId = input.id === 'crPay' ? 'crPayDropdown' : 'mrPayDropdown';
-  ensurePayDropdownOpen(input.id, dropdownId, '');
+  const input = e.target.closest('.pay-search .sub-search-input');
+  if (input) ensurePayDropdownOpenFor(input, '');
 });
 document.addEventListener('input', e => {
-  const input = e.target.closest('#crPay, #mrPay');
-  if (!input) return;
-  const dropdownId = input.id === 'crPay' ? 'crPayDropdown' : 'mrPayDropdown';
-  ensurePayDropdownOpen(input.id, dropdownId, input.value);
+  const input = e.target.closest('.pay-search .sub-search-input');
+  if (input) ensurePayDropdownOpenFor(input, input.value);
 });
 document.addEventListener('mousedown', e => {
   const item = e.target.closest('.pay-search-item');
@@ -2090,13 +2214,12 @@ document.addEventListener('mousedown', e => {
     const wrap = item.closest('.pay-search');
     const input = wrap ? wrap.querySelector('.sub-search-input') : null;
     if (!input) return;
-    applyPaySelection(input.id, item.dataset.name);
+    applyPaySelection(input, item.dataset.name);
     e.preventDefault();
     return;
   }
-  if (!e.target.closest('#crPayWrap, #mrPayWrap, .pay-search-item')) {
-    closePayDropdown('crPayDropdown');
-    closePayDropdown('mrPayDropdown');
+  if (!e.target.closest('.pay-search')) {
+    document.querySelectorAll('.pay-search .sub-search-dropdown.open').forEach(d => d.classList.remove('open'));
   }
 });
 /* 会员搜索下拉选择 */
