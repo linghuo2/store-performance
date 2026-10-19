@@ -93,6 +93,13 @@ table.editable tr.dirty td { background: #fff8e6; }
 .rec-stat b { color: var(--ink); font-size: 15px; font-weight: 700; margin-right: 4px; }
 .rec-stat.none { color: #b54708; background: #fffaeb; border-color: #fedf89; }
 .export-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: #f7f9ff;border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+/* 未同步提醒横幅：本机有改动没发到线上时显示在顶栏下方 */
+.sync-warn { display: flex; align-items: center; gap: 12px; background: #fff4ec; border: 1px solid #ffb27a; border-left: 4px solid #e8590c; border-radius: 8px; padding: 10px 14px; margin: 10px auto 0; max-width: 1240px; }
+.sync-warn .ic { font-size: 18px; line-height: 1; }
+.sync-warn .txt { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.sync-warn .txt b { color: #b4230f; font-size: 13.5px; }
+.sync-warn .txt span { color: #8a4b2a; font-size: 12px; }
+
 .export-bar .exp-label { font-size: 13.5px; font-weight: 600; color: var(--ink); }
 
 /* 经营总览时间筛选条 */
