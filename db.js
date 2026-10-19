@@ -11,10 +11,12 @@ window.DB = (function () {
      新设备打开就是空的，老设备之间也互相看不到对方的新登记（表现为「数据停在 X 号」）。
      所以同时连 3 家独立 broker，订阅全部、发布全部：任意一家留存还在，数据就能接力回来。
      老版本设备仍只连第 1 家（emqx），而新版会向 3 家全发，因此完全向后兼容。 */
+  /* 第三家实测：broker.hivemq.com 从国内网络连不上（超时），
+     换成它同厂的 www.mqtt-dashboard.com（同为 HiveMQ 公共集群，实测可达）。 */
   const BROKERS = [
     { name: '主·EMQX',     url: 'wss://broker.emqx.io:8084/mqtt' },
     { name: '备·EMQX中国', url: 'wss://broker-cn.emqx.io:8084/mqtt' },
-    { name: '备·HiveMQ',   url: 'wss://broker.hivemq.com:8884/mqtt' }
+    { name: '备·HiveMQ',   url: 'wss://www.mqtt-dashboard.com:8884/mqtt' }
   ];
   const DEFAULT_ROOM = 'shop_mendian';   // 正式门店码（没带 ?room= 时一律用它，绝不随机）
   const rand = () => Math.random().toString(36).slice(2, 10);
