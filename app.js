@@ -115,6 +115,34 @@ function updateLive() {
   }
 }
 
+/* --------------------- 未同步提醒横幅 --------------------- */
+/* 店里信号差时最常见的情况：业绩登记成功存进本机，但没发到线上，别人看不到。
+   以前完全没有提示，只能靠「数据怎么停在 X 号」事后发现。这里实时显示并支持一键补传。 */
+function fmtAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
+  return Math.floor(s / 86400) + ' 天前';
+}
+function updateSyncWarn() {
+  const box = $('#syncWarn');
+  if (!box) return;
+  const u = (DB.getUnsyncedInfo && DB.getUnsyncedInfo()) || {};
+  if (!u.unsynced) { if (box.innerHTML) box.innerHTML = ''; return; }
+  const since = u.since ? '　最后改动 ' + fmtAgo(u.since) : '';
+  const tail = u.connected
+    ? '已连上服务器，正在自动重试…'
+    : '当前网络不通（可用通道 ' + (u.brokerOk || 0) + '/' + (u.brokerTotal || 0) + '），恢复网络后会自动补传';
+  box.innerHTML = `<div class="sync-warn">
+    <span class="ic">⚠</span>
+    <div class="txt"><b>本机有改动还没同步到线上</b><span>${tail}${since}</span></div>
+    <button class="btn sm danger" data-action="sync-retry">立即补传</button>
+  </div>`;
+}
+setInterval(updateSyncWarn, 4000);
+
 /* ----------------------------- 登录 ----------------------------- */
 async function doLogin(username, password) {
   timeRange.mode = 'all'; timeRange.from = ''; timeRange.to = ''; timeRange.month = '';
@@ -207,10 +235,11 @@ function render() {
     <button class="btn ghost sm" id="pwBtn">修改密码</button>
     <button class="btn ghost sm" id="logoutBtn">退出</button>
   </div>`;
-  $('#app').innerHTML = top + `<div class="container" id="main"></div>` + subDatalistHTML() + payDatalistHTML();
+  $('#app').innerHTML = top + `<div id="syncWarn"></div>` + `<div class="container" id="main"></div>` + subDatalistHTML() + payDatalistHTML();
   $('#logoutBtn').onclick = doLogout;
   $('#pwBtn').onclick = openPasswordModal;
   updateLive();
+  updateSyncWarn();
   if (me.role === 'boss' || me.role === 'regional') renderBoss();
   else if (me.role === 'manager') renderManager();
   else renderClerk();
@@ -1159,7 +1188,11 @@ function showDiagPanel() {
         <tr><th>会员数</th><td>${info.memberCount || 0} 位</td></tr>
         <tr><th>数据版本</th><td>v${info.version || 0}</td></tr>
         <tr><th>状态更新时间</th><td>${info.ts ? new Date(info.ts).toLocaleString('zh-CN') : '—'}</td></tr>
-        <tr><th>实时连接</th><td>${info.connected ? '<span style="color:#067647;">已连接</span>' : '<span style="color:#b54708;">未连接（数据暂无法同步）</span>'}</td></tr>
+        <tr><th>同步通道</th><td>${(info.brokers || []).map(b => `<span style="margin-right:10px;">${b.connected ? '🟢' : '⚪'} ${esc(b.name)}</span>`).join('') || '—'}
+          <div class="muted" style="font-size:12px;margin-top:4px;">已接通 ${info.brokerOk || 0}/${info.brokerTotal || 0} 条。同时向多家服务器发送，任意一家留存还在就能取回数据。</div></td></tr>
+        <tr><th>未同步改动</th><td>${info.unsynced
+          ? `<span style="color:#b42318;font-weight:600;">有改动未发出去${info.unsyncedSince ? '（自 ' + new Date(info.unsyncedSince).toLocaleString('zh-CN') + '）' : ''}</span>`
+          : (info.lastPublishAt ? '<span style="color:#067647;">无 · 最近上传 ' + fmtAgo(info.lastPublishAt) + '</span>' : '<span class="muted">—</span>')}</td></tr>
         ${(function () {
           const g = info.guard || {};
           if (!g.hasRemote) return '<tr><th>上传前自检</th><td class="muted">尚未收到线上数据</td></tr>';
@@ -1591,6 +1624,12 @@ document.addEventListener('click', async e => {
   const action = btn.dataset.action;
   const id = btn.dataset.id;
 
+  if (action === 'sync-retry') {
+    const ok = !!(DB.forcePushLocal && DB.forcePushLocal());
+    toast(ok ? '已补传到线上，其他设备刷新后即可看到' : '仍然连不上服务器，请检查网络后重试', !ok);
+    updateSyncWarn();
+    return;
+  }
   if (action === 'export-xlsx') {
     const m = $('#expMonth') ? $('#expMonth').value : '';
     await exportXLSX(m);
