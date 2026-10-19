@@ -690,6 +690,56 @@ window.DB = (function () {
   }
   function anyConnected() { return clients.some(c => c.connected); }
 
+  /* ============================ 设备间接力（2026-10-19 加） ============================
+     背景：公共 broker 的「留存消息」只存内存，broker 一重启就全没了。
+     三家全丢时，单靠 broker 已拿不回数据 —— 但店里通常至少有一台设备（老板电脑/店长手机）
+     是开着页面的，它本地那份数据就是活的备份。
+     机制：新设备上线后往 hello 频道喊一声「我这儿是空的，谁有数据？」，在线的伙伴听到后
+     把自己那份（已与线上合并过的完整版）推回 state 频道，新设备就能重建。
+     —— 纯 MQTT，无任何外部服务依赖；旧版本设备不订阅 hello，因此不会被打扰，完全向后兼容。 */
+  const myPeerId = 'p' + rand() + Date.now();
+  let helloCount = 0, helloWindowStart = 0;
+  let helloOnConnectDone = false;   // 每次连上线只安排一次求助（多 broker 不重复）
+  const answeredAt = new Map();       // 伙伴 id -> 上次应答时间（避免同一个人反复打扰）
+  function helloQuotaLeft() {
+    const now = Date.now();
+    if (now - helloWindowStart > 60000) { helloWindowStart = now; helloCount = 0; }
+    return helloCount < 3;            // 每 60 秒最多求助 3 次，防止刷屏
+  }
+  function sendHello() {
+    if (!clients.length || !anyConnected()) return;
+    if (!helloQuotaLeft()) return;
+    helloCount++;
+    const payload = JSON.stringify({ who: myPeerId, ts: Date.now() });
+    clients.forEach(c => {
+      if (c.cli && c.connected) { try { c.cli.publish('shop/' + room + '/hello', payload, { qos: 0 }); } catch (e) {} }
+    });
+  }
+  /* 应答：把「已与线上留存取过并集」的完整数据推回去。
+     先走 guardBeforePublish()，确保自己手上缺的那部分也补上了再发，绝不拿残缺数据糊弄人。
+     不 ++version、不写 localStorage —— 这只是原样托出，不产生新的改动。 */
+  function answerHello() {
+    if (!state || !state.db) return;
+    migrateState();
+    guardBeforePublish();
+    const now = Date.now();
+    const payload = JSON.stringify({ version: state.version || 0, ts: now, db: state.db });
+    let sent = 0;
+    clients.forEach(c => {
+      if (c.cli && c.connected) { try { c.cli.publish('shop/' + room + '/state', payload, { qos: 0, retain: true }); sent++; } catch (e) {} }
+    });
+    if (sent > 0) lastPublishAt = now;
+  }
+  function onHello(payloadStr) {
+    let h = null; try { h = JSON.parse(payloadStr); } catch (e) { return; }
+    if (!h || !h.who || h.who === myPeerId) return;      // 忽略自己的回声
+    const now = Date.now();
+    if (now - (answeredAt.get(h.who) || 0) < 30000) return;  // 同一台设备 30 秒内只答一次
+    answeredAt.set(h.who, now);
+    // 随机错峰：多台设备同时在线时不至于一起涌上去
+    setTimeout(answerHello, 120 + Math.floor(Math.random() * 500));
+  }
+
   function connectMQTT() {
     if (typeof mqtt === 'undefined') { console.warn('mqtt lib 未加载'); return; }
     clients = BROKERS.map(b => {
@@ -702,6 +752,7 @@ window.DB = (function () {
       cli.on('connect', () => {
         rec.connected = true;
         try { cli.subscribe('shop/' + room + '/state', { qos: 0 }); } catch (e) {}
+        try { cli.subscribe('shop/' + room + '/hello', { qos: 0 }); } catch (e) {}   // 求助频道
         /* 关键：不立刻上传。MQTT 的保留消息会在订阅后稍晚送达，
            若此刻抢先上传本机（可能已落后）的数据，就会把线上整包覆盖 —— 这是 9/8 事故的根因。
            改为：等线上留存到达（或最多等 3 秒）再上传，且上传前会先并回本机缺失的数据。
@@ -718,9 +769,20 @@ window.DB = (function () {
             if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; f(); }
           }, 3000);
         }
+        /* 上线求助：若 broker 的留存已被清空，靠在线的伙伴把数据送回来。
+           只在「首次连上」时喊（三家 broker 都会触发 connect，别重复消耗配额）；
+           5 秒后若线上数据仍未到，再补喊一次。 */
+        if (!helloOnConnectDone) {
+          helloOnConnectDone = true;
+          setTimeout(sendHello, 800);
+          setTimeout(() => { if (!remoteShadow) sendHello(); }, 5000);
+        }
         if (updateCb) updateCb();
       });
-      cli.on('message', (topic, message) => { if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString()); });
+      cli.on('message', (topic, message) => {
+        if (topic === 'shop/' + room + '/hello') { onHello(message.toString()); return; }
+        if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString());
+      });
       cli.on('error', () => {});
       cli.on('close', () => { rec.connected = false; });
       cli.on('offline', () => { rec.connected = false; });
@@ -845,6 +907,8 @@ window.DB = (function () {
       unsynced,                          // 有改动没发出去（信号差时会是 true）
       unsyncedSince: unsyncedSince || 0,
       lastPublishAt: lastPublishAt || 0,
+      peerId: myPeerId,
+      peersAnswered: answeredAt.size,    // 本机应答过几个伙伴（说明本机数据在往外接力）
       recordCount: recs.length,
       memberCount: mems.length,
       firstDate: dates[0] || '',
@@ -954,6 +1018,6 @@ window.DB = (function () {
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
-    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo
+    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo, sendHello
   };
 })();
