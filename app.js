@@ -1201,10 +1201,13 @@ function showDiagPanel() {
             : '<span style="color:#067647;">正常：本机不缺线上记录，不会覆盖他人数据</span>';
           return `<tr><th>上传前自检</th><td>线上快照 ${g.remoteRecords || 0} 条 / v${g.remoteVer || 0} · ${heal}</td></tr>`;
         })()}
+        <tr><th>伙伴接力</th><td>${info.peersAnswered ? `<span style="color:#067647;">本机已向 ${info.peersAnswered} 台在线设备送过数据</span>` : '<span class="muted">暂未收到其它设备的求助</span>'}
+          <div class="muted" style="font-size:12px;margin-top:4px;">换了新手机 / 清了缓存 / 线上留存丢失时，可让正在开着的设备（如老板电脑）把数据接力过来。</div></td></tr>
       </tbody></table>
       ${junkHTML()}
       <div class="sc-warn" style="margin-top:12px;">如果本机记录数<b>多于线上看到的数量</b>，点下方按钮把本机数据上传合并到线上。合并是按条并集，<b>不会删除任何一方的记录</b>；上传前会自动先把线上缺失的记录并回本机，<b>因此也不会覆盖他人的登记</b>。</div>
       <div class="modal-actions">
+        <button class="btn ghost" id="diagHello">向伙伴求助</button>
         <button class="btn ghost" id="diagClose">关闭</button>
         <button class="btn" id="diagPush">上传本机数据到线上</button>
       </div>
@@ -1212,6 +1215,16 @@ function showDiagPanel() {
   document.body.appendChild(mask);
   mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
   mask.querySelector('#diagClose').onclick = () => mask.remove();
+  /* 向伙伴求助：本机数据缺失时，让在线的其它设备把数据接力过来。
+     典型场景：换了新手机、清了浏览器缓存、或线上留存被服务器清空。 */
+  mask.querySelector('#diagHello').onclick = () => {
+    const btn = mask.querySelector('#diagHello');
+    if (!(DB.sendHello && typeof DB.sendHello === 'function')) { toast('当前版本不支持该功能', true); return; }
+    DB.sendHello();
+    if (btn) btn.textContent = '已发出求助 ✓';
+    toast('已向本店在线设备发出求助，正在等待回应…', false);
+    setTimeout(() => { try { mask.remove(); showDiagPanel(); } catch (e) {} }, 2500);
+  };
   mask.querySelector('#diagPush').onclick = () => {
     const ok = !!(DB.forcePushLocal && DB.forcePushLocal());
     const btn = mask.querySelector('#diagPush');
