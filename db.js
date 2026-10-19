@@ -662,7 +662,7 @@ window.DB = (function () {
   }
   function mergeIncoming(payload) {
     try {
-      const inc = JSON.parse(payload);
+      const inc = unpackPayload(payload);
       if (!inc || !inc.db) return;
       migrateState();
       remoteShadow = inc.db;                        // 记住线上长什么样，用于上传前自检
@@ -679,7 +679,8 @@ window.DB = (function () {
   /* 向所有已连接的 broker 广播当前状态；返回实际发出去的家数（0 = 一家都没通） */
   function publishAll() {
     if (!state) return 0;
-    const payload = JSON.stringify(state);
+    const payload = packPayload(state);      // 压缩后再发，否则超过 broker 上限会被静默丢弃
+    checkPayloadSize(payload);
     let sent = 0;
     clients.forEach(c => {
       if (c.cli && c.connected) {
@@ -691,6 +692,85 @@ window.DB = (function () {
     return sent;
   }
   function anyConnected() { return clients.some(c => c.connected); }
+
+  /* ============================ 载荷压缩（2026-10-19 事故根因修复） ============================
+     实测：公共 broker EMQX 的单条消息上限在 64KB～128KB 之间（64KB 通过、128KB 被拒），
+     超过后**静默丢弃、不报任何错**。本系统每次登记都上传一份「全量状态」，
+     数据量一涨过上限，所有上传就都石沉大海 —— 表现正是「数据停在 X 号」（本次停在 10/15）。
+     实测 686 条 = 243KB，gzip 后仅 23KB（base64 后 30KB），压缩率约 9%。
+     格式：压缩后加前缀 GZ1:；未压缩的老数据没有前缀，照样能读 —— 与老版本设备双向兼容。 */
+  const PACK_PREFIX = 'GZ1:';
+  const SAFE_MAX = 60000;        // 安全线（EMQX 实测 64KB 可过，留点余量）
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+  function bytesToB64(u8) {      // 手写 base64：不依赖 btoa，分块处理避免大数组爆栈
+    let out = '';
+    /* 分块大小必须是 3 的倍数：base64 以 3 字节为一组，
+       若块长不是 3 的倍数，块尾会插入 padding '='，把下一块的对齐整体打乱 —— 
+       表现为小数据正常、超过一个块（几万字节）后解压失败。踩过这个坑。 */
+    const CH = 3 * 8192;
+    for (let i = 0; i < u8.length; i += CH) {
+      const chunk = u8.subarray(i, Math.min(i + CH, u8.length));
+      let s = '';
+      for (let j = 0; j < chunk.length; j++) s += String.fromCharCode(chunk[j]);
+      out += b64EncodeChars(s);
+    }
+    return out;
+  }
+  function b64EncodeChars(s) {
+    let out = '';
+    for (let i = 0; i < s.length; i += 3) {
+      const c0 = s.charCodeAt(i), c1 = s.charCodeAt(i + 1), c2 = s.charCodeAt(i + 2);
+      out += B64[c0 >> 2];
+      out += B64[((c0 & 3) << 4) | ((c1 || 0) >> 4)];
+      out += isNaN(c1) ? '=' : B64[((c1 & 15) << 2) | ((c2 || 0) >> 6)];
+      out += isNaN(c2) ? '=' : B64[c2 & 63];
+    }
+    return out;
+  }
+  function b64ToBytes(b64) {
+    const bin = b64.replace(/[^A-Za-z0-9+/]/g, '');
+    const out = new Uint8Array(Math.floor(bin.length * 3 / 4));
+    let p = 0;
+    for (let i = 0; i < bin.length; i += 4) {
+      const a = B64.indexOf(bin[i]), b = B64.indexOf(bin[i + 1]);
+      const c = B64.indexOf(bin[i + 2]), d = B64.indexOf(bin[i + 3]);
+      const n = (a << 18) | (b << 12) | ((c < 0 ? 0 : c) << 6) | (d < 0 ? 0 : d);
+      if (p < out.length) out[p++] = (n >> 16) & 255;
+      if (c >= 0 && p < out.length) out[p++] = (n >> 8) & 255;
+      if (d >= 0 && p < out.length) out[p++] = n & 255;
+    }
+    return out.subarray(0, p);
+  }
+  /* 打包：能压就压（压缩后体积极小，才扛得住 broker 的大小限制） */
+  function packPayload(obj) {
+    const s = JSON.stringify(obj);
+    try {
+      if (typeof pako !== 'undefined' && typeof pako.gzip === 'function') {
+        const gz = pako.gzip(s, { level: 6 });
+        return PACK_PREFIX + bytesToB64(gz);
+      }
+    } catch (e) {}
+    return s;                       // pako 没加载成功就原样发（老行为）
+  }
+  /* 解包：自动识别压缩与否，老设备发来的未压缩数据照样能读 */
+  function unpackPayload(str) {
+    if (typeof str === 'string' && str.slice(0, PACK_PREFIX.length) === PACK_PREFIX) {
+      try {
+        if (typeof pako === 'undefined' || typeof pako.ungzip !== 'function') return null;
+        return JSON.parse(pako.ungzip(b64ToBytes(str.slice(PACK_PREFIX.length)), { to: 'string' }));
+      } catch (e) { return null; }
+    }
+    try { return JSON.parse(str); } catch (e) { return null; }
+  }
+  /* 上传前的体积体检：压完还超限就明确告警，绝不让「同步失败」变成无声无息 */
+  function checkPayloadSize(payload) {
+    if (payload.length <= SAFE_MAX) return true;
+    const kb = Math.round(payload.length / 1024);
+    console.warn('[同步] 压缩后仍有 ' + kb + ' KB，超过 broker 上限，本次上传很可能被丢弃');
+    notifySync('数据量过大（' + kb + 'KB），同步可能失败，请联系管理员归档历史数据', true);
+    return false;
+  }
 
   /* ============================ 设备间接力（2026-10-19 加） ============================
      背景：公共 broker 的「留存消息」只存内存，broker 一重启就全没了。
@@ -725,7 +805,7 @@ window.DB = (function () {
     migrateState();
     guardBeforePublish();
     const now = Date.now();
-    const payload = JSON.stringify({ version: state.version || 0, ts: now, db: state.db });
+    const payload = packPayload({ version: state.version || 0, ts: now, db: state.db });
     let sent = 0;
     clients.forEach(c => {
       if (c.cli && c.connected) { try { c.cli.publish('shop/' + room + '/state', payload, { qos: 0, retain: true }); sent++; } catch (e) {} }
@@ -1020,6 +1100,14 @@ window.DB = (function () {
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
-    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo, sendHello
+    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo, sendHello,
+    packPayload, unpackPayload, getPayloadInfo
   };
+  /* 供界面/运维查看：当前这份数据压完有多大、离上限还有多远 */
+  function getPayloadInfo() {
+    if (!state) return { raw: 0, packed: 0, packedKB: 0, over: false, limit: SAFE_MAX };
+    const raw = JSON.stringify(state).length;
+    const packed = packPayload(state).length;
+    return { raw, packed, packedKB: Math.round(packed / 1024), over: packed > SAFE_MAX, limit: SAFE_MAX };
+  }
 })();
