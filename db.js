@@ -32,6 +32,15 @@ window.DB = (function () {
   let lastPublishAt = 0;       // 最近一次成功发出去的时间
   let retryTimer = null;
 
+  /* ---- 分片接收缓冲（2026-10-20 加，解决压缩后仍会超限的问题） ---- */
+  let partBuf = {};            // 已收到的分片 { 序号: 内容 }
+  let partExpect = 0;          // 目录声明的总片数（0 = 当前不是分片模式）
+  let partTotal = 0;           // 目录声明的总长度，用于校验拼接是否完整
+  let partWarnTimer = null;
+  let partManifest = '';       // 当前目录原文（用于三家 broker 重复投递时去重）
+  let lastOkManifest = '';     // 最近一次成功组装并合并的目录
+  let lastPartCount = 0;       // 上次发布用了几片（用于清除残留的过期分片）
+
   /* ---- 反向覆盖防护（旧设备持旧数据上线会把线上整包盖掉，2026-09-08 事故后加） ---- */
   let remoteShadow = null;       // 最近一次收到的「线上完整数据」快照（原始，未与本机合并）
   let remoteShadowVer = 0;       // 该快照对应的版本号
@@ -676,22 +685,98 @@ window.DB = (function () {
       if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; clearTimeout(connectPublishTimer); f(); }
     } catch (e) {}
   }
+  const baseTopic = () => 'shop/' + room + '/state';
+  const partTopic = i => 'shop/' + room + '/state/p' + i;
+
+  function splitPayload(s) {
+    const n = Math.ceil(s.length / CHUNK);
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(s.substr(i * CHUNK, CHUNK));
+    return out;
+  }
+  /* 把打包后的载荷发到所有 broker：不超限就一整条，超限自动分片。返回发出去的家数。 */
+  function publishPayload(payload) {
+    const parts = payload.length > SAFE_MAX ? splitPayload(payload) : null;
+    const want = parts ? parts.length : 0;
+    let sent = 0;
+    clients.forEach(c => {
+      if (!c.cli || !c.connected) return;
+      try {
+        if (!parts) {
+          c.cli.publish(baseTopic(), payload, { qos: 0, retain: true });
+        } else {
+          c.cli.publish(baseTopic(), SPLIT_PREFIX + parts.length + ':' + payload.length, { qos: 0, retain: true });
+          parts.forEach((p, i) => { c.cli.publish(partTopic(i), p, { qos: 0, retain: true }); });
+        }
+        sent++;
+      } catch (e) {}
+    });
+    /* 数据变小、片数变少时，把上一版残留的多余分片清掉（发空 retain 是 MQTT 标准的清除方式），
+       否则下次片数重新变多时，可能拼进一个过期分片 —— 但即使拼错，长度校验也会拦下。 */
+    for (let i = want; i < lastPartCount; i++) {
+      clients.forEach(c => {
+        if (c.cli && c.connected) { try { c.cli.publish(partTopic(i), '', { qos: 0, retain: true }); } catch (e) {} }
+      });
+    }
+    lastPartCount = want;
+    return sent;
+  }
+
   /* 向所有已连接的 broker 广播当前状态；返回实际发出去的家数（0 = 一家都没通） */
   function publishAll() {
     if (!state) return 0;
     const payload = packPayload(state);      // 压缩后再发，否则超过 broker 上限会被静默丢弃
     checkPayloadSize(payload);
-    let sent = 0;
-    clients.forEach(c => {
-      if (c.cli && c.connected) {
-        try { c.cli.publish('shop/' + room + '/state', payload, { qos: 0, retain: true }); sent++; }
-        catch (e) {}
-      }
-    });
+    const sent = publishPayload(payload);
     if (sent > 0) lastPublishAt = Date.now();
     return sent;
   }
   function anyConnected() { return clients.some(c => c.connected); }
+
+  /* ---------------- 分片接收：目录 + 数据块 → 拼回完整载荷 ---------------- */
+  function onManifest(body) {
+    const m = body.slice(SPLIT_PREFIX.length).split(':');
+    const n = parseInt(m[0], 10);
+    if (!(n > 0)) return;
+    partExpect = n;
+    partTotal = parseInt(m[1], 10) || 0;
+    partManifest = body;
+    /* 绝不在这里清空 partBuf！真实 broker 的 retained 消息到达顺序不保证，
+       分片常常比目录先到 —— 一清空就永远凑不齐（表现为「数据死活同步不过来」）。
+       旧分片的安全性由两道保险兜住：新分片会覆盖同序号旧片；拼错则长度校验拦下。 */
+    tryAssemble();
+    if (partExpect) {                // 还没齐：4 秒后仍缺片就明确报警，绝不静默失败
+      if (partWarnTimer) clearTimeout(partWarnTimer);
+      partWarnTimer = setTimeout(() => {
+        if (!partExpect) return;
+        let missing = 0;
+        for (let i = 0; i < partExpect; i++) if (typeof partBuf[i] !== 'string') missing++;
+        notifySync('线上数据分片不完整（缺 ' + missing + '/' + partExpect + ' 片），本次未更新，稍后会自动重试', true);
+      }, 4000);
+    }
+  }
+  function onPart(idx, s) {
+    if (s === '') { delete partBuf[idx]; return; }   // 空 payload = 已被清除的分片，不能当数据拼进去
+    partBuf[idx] = s;
+    tryAssemble();
+  }
+  function tryAssemble() {
+    if (!partExpect) return;
+    for (let i = 0; i < partExpect; i++) if (typeof partBuf[i] !== 'string') return;
+    let s = '';
+    for (let i = 0; i < partExpect; i++) s += partBuf[i];
+    const total = partTotal, mani = partManifest;
+    partExpect = 0; partTotal = 0; partManifest = '';
+    if (partWarnTimer) { clearTimeout(partWarnTimer); partWarnTimer = null; }
+    if (total && s.length !== total) {
+      notifySync('线上数据分片长度不符（' + s.length + '≠' + total + '），已跳过以免写坏数据', true);
+      return;
+    }
+    /* 三家 broker 各会送来一份相同的目录与分片，去重只处理一次，避免重复合并开销 */
+    if (mani && mani === lastOkManifest) return;
+    lastOkManifest = mani;
+    mergeIncoming(s);
+  }
 
   /* ============================ 载荷压缩（2026-10-19 事故根因修复） ============================
      实测：公共 broker EMQX 的单条消息上限在 64KB～128KB 之间（64KB 通过、128KB 被拒），
@@ -701,6 +786,12 @@ window.DB = (function () {
      格式：压缩后加前缀 GZ1:；未压缩的老数据没有前缀，照样能读 —— 与老版本设备双向兼容。 */
   const PACK_PREFIX = 'GZ1:';
   const SAFE_MAX = 60000;        // 安全线（EMQX 实测 64KB 可过，留点余量）
+  /* 分片（2026-10-20 加）：压缩只能把 1500 条压到 65KB —— 仍超安全线，11 月底必然复发。
+     所以再叠一层：压缩后仍超安全线就拆成多片，每片 48KB，发到 state/p0、state/p1…
+     主 topic 只发一行「目录」GZ2:<片数>:<总长度>。这样容量不再有实际上限。
+     每片都远低于 60KB，永远不会触发 broker 的静默丢弃。 */
+  const SPLIT_PREFIX = 'GZ2:';
+  const CHUNK = 48000;
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
   function bytesToB64(u8) {      // 手写 base64：不依赖 btoa，分块处理避免大数组爆栈
@@ -763,13 +854,16 @@ window.DB = (function () {
     }
     try { return JSON.parse(str); } catch (e) { return null; }
   }
-  /* 上传前的体积体检：压完还超限就明确告警，绝不让「同步失败」变成无声无息 */
+  /* 上传前的体积体检：分片后每片都在安全线内，所以不会再「超限失败」。
+     但片数过多会增加「任一片丢失就整包作废」的概率，超过 20 片时给出提醒。 */
   function checkPayloadSize(payload) {
     if (payload.length <= SAFE_MAX) return true;
-    const kb = Math.round(payload.length / 1024);
-    console.warn('[同步] 压缩后仍有 ' + kb + ' KB，超过 broker 上限，本次上传很可能被丢弃');
-    notifySync('数据量过大（' + kb + 'KB），同步可能失败，请联系管理员归档历史数据', true);
-    return false;
+    const n = Math.ceil(payload.length / CHUNK);
+    if (n > 20) {
+      console.warn('[同步] 压缩后 ' + Math.round(payload.length / 1024) + ' KB，需分 ' + n + ' 片');
+      notifySync('数据量很大（分 ' + n + ' 片传输），建议归档历史数据以加快同步', false);
+    }
+    return true;
   }
 
   /* ============================ 设备间接力（2026-10-19 加） ============================
@@ -806,10 +900,7 @@ window.DB = (function () {
     guardBeforePublish();
     const now = Date.now();
     const payload = packPayload({ version: state.version || 0, ts: now, db: state.db });
-    let sent = 0;
-    clients.forEach(c => {
-      if (c.cli && c.connected) { try { c.cli.publish('shop/' + room + '/state', payload, { qos: 0, retain: true }); sent++; } catch (e) {} }
-    });
+    const sent = publishPayload(payload);      // 同样走分片，大数据也能完整托出
     if (sent > 0) lastPublishAt = now;
   }
   function onHello(payloadStr) {
@@ -834,6 +925,7 @@ window.DB = (function () {
       cli.on('connect', () => {
         rec.connected = true;
         try { cli.subscribe('shop/' + room + '/state', { qos: 0 }); } catch (e) {}
+        try { cli.subscribe('shop/' + room + '/state/+', { qos: 0 }); } catch (e) {}  // 分片频道（大数据拆成多片）
         try { cli.subscribe('shop/' + room + '/hello', { qos: 0 }); } catch (e) {}   // 求助频道
         /* 关键：不立刻上传。MQTT 的保留消息会在订阅后稍晚送达，
            若此刻抢先上传本机（可能已落后）的数据，就会把线上整包覆盖 —— 这是 9/8 事故的根因。
@@ -862,8 +954,18 @@ window.DB = (function () {
         if (updateCb) updateCb();
       });
       cli.on('message', (topic, message) => {
-        if (topic === 'shop/' + room + '/hello') { onHello(message.toString()); return; }
-        if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString());
+        const s = message.toString();
+        if (topic === 'shop/' + room + '/hello') { onHello(s); return; }
+        if (topic === baseTopic()) {
+          if (s.slice(0, SPLIT_PREFIX.length) === SPLIT_PREFIX) onManifest(s);
+          else mergeIncoming(s);
+          return;
+        }
+        const pfx = baseTopic() + '/p';
+        if (topic.indexOf(pfx) === 0) {                 // state/pN 分片
+          const idx = parseInt(topic.slice(pfx.length), 10);
+          if (!isNaN(idx)) onPart(idx, s);
+        }
       });
       cli.on('error', () => {});
       cli.on('close', () => { rec.connected = false; });
@@ -1101,13 +1203,16 @@ window.DB = (function () {
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
     getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo, sendHello,
-    packPayload, unpackPayload, getPayloadInfo
+    packPayload, unpackPayload, getPayloadInfo,
+    splitPayload, publishPayload, onManifest, onPart, baseTopic, partTopic
   };
   /* 供界面/运维查看：当前这份数据压完有多大、离上限还有多远 */
   function getPayloadInfo() {
-    if (!state) return { raw: 0, packed: 0, packedKB: 0, over: false, limit: SAFE_MAX };
+    if (!state) return { raw: 0, packed: 0, packedKB: 0, parts: 0, over: false, limit: SAFE_MAX };
     const raw = JSON.stringify(state).length;
     const packed = packPayload(state).length;
-    return { raw, packed, packedKB: Math.round(packed / 1024), over: packed > SAFE_MAX, limit: SAFE_MAX };
+    const parts = packed > SAFE_MAX ? Math.ceil(packed / CHUNK) : 1;
+    /* over 的含义变了：分片后不再会「传不出去」，而是片数过多容易丢片 */
+    return { raw, packed, packedKB: Math.round(packed / 1024), parts, over: packed > SAFE_MAX, limit: SAFE_MAX };
   }
 })();
