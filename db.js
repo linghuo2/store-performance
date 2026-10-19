@@ -6,14 +6,29 @@
  * 注意：此为演示级架构，数据经公共 broker 中转，非敏感内部数据可接受；请勿用于机密业务。
  */
 window.DB = (function () {
-  const BROKER = 'wss://broker.emqx.io:8084/mqtt';
+  /* 多 broker 冗余（2026-10-19 事故后加）：
+     公共 broker 的「留存消息」只存在内存里，broker 一重启就全没了 —— 一旦丢失，
+     新设备打开就是空的，老设备之间也互相看不到对方的新登记（表现为「数据停在 X 号」）。
+     所以同时连 3 家独立 broker，订阅全部、发布全部：任意一家留存还在，数据就能接力回来。
+     老版本设备仍只连第 1 家（emqx），而新版会向 3 家全发，因此完全向后兼容。 */
+  const BROKERS = [
+    { name: '主·EMQX',     url: 'wss://broker.emqx.io:8084/mqtt' },
+    { name: '备·EMQX中国', url: 'wss://broker-cn.emqx.io:8084/mqtt' },
+    { name: '备·HiveMQ',   url: 'wss://broker.hivemq.com:8884/mqtt' }
+  ];
   const DEFAULT_ROOM = 'shop_mendian';   // 正式门店码（没带 ?room= 时一律用它，绝不随机）
   const rand = () => Math.random().toString(36).slice(2, 10);
 
   let room = null;
   let state = null;            // { version, ts, db }
-  let client = null;
+  let clients = [];            // [{ name, url, cli, connected }]
   let updateCb = null;
+
+  /* ---- 未同步标记：本地有改动但一家 broker 都没发出去（店里信号差最常见） ---- */
+  let unsynced = false;        // 有改动没发出去
+  let unsyncedSince = 0;
+  let lastPublishAt = 0;       // 最近一次成功发出去的时间
+  let retryTimer = null;
 
   /* ---- 反向覆盖防护（旧设备持旧数据上线会把线上整包盖掉，2026-09-08 事故后加） ---- */
   let remoteShadow = null;       // 最近一次收到的「线上完整数据」快照（原始，未与本机合并）
@@ -166,7 +181,7 @@ window.DB = (function () {
   function waitForSync(maxMs) {
     return new Promise(resolve => {
       if (remoteShadow) return resolve(true);
-      if (!(client && client.connected)) return resolve(false);   // 根本没连上，别干等
+      if (!anyConnected()) return resolve(false);   // 根本没连上，别干等
       const t0 = Date.now(), limit = maxMs || 3000;
       const iv = setInterval(() => {
         if (remoteShadow || Date.now() - t0 >= limit) { clearInterval(iv); resolve(!!remoteShadow); }
@@ -216,9 +231,9 @@ window.DB = (function () {
   /* ----------------------------- 变更操作（改后 publishState） ----------------------------- */
   function publishState() {
     buildOutgoing();                       // 自检 + 并回线上缺失数据 + 版本递增 + 落盘
-    if (client && client.connected) {
-      client.publish('shop/' + room + '/state', JSON.stringify(state), { qos: 0, retain: true });
-    }
+    const sent = publishAll();             // 向 3 家 broker 全发
+    if (sent > 0) unsynced = false;
+    else { if (!unsynced) unsyncedSince = Date.now(); unsynced = true; }   // 一家都没通 → 标记为未同步
     if (updateCb) updateCb();
   }
   async function addRegion(name) {
@@ -659,29 +674,69 @@ window.DB = (function () {
       if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; clearTimeout(connectPublishTimer); f(); }
     } catch (e) {}
   }
+  /* 向所有已连接的 broker 广播当前状态；返回实际发出去的家数（0 = 一家都没通） */
+  function publishAll() {
+    if (!state) return 0;
+    const payload = JSON.stringify(state);
+    let sent = 0;
+    clients.forEach(c => {
+      if (c.cli && c.connected) {
+        try { c.cli.publish('shop/' + room + '/state', payload, { qos: 0, retain: true }); sent++; }
+        catch (e) {}
+      }
+    });
+    if (sent > 0) lastPublishAt = Date.now();
+    return sent;
+  }
+  function anyConnected() { return clients.some(c => c.connected); }
+
   function connectMQTT() {
     if (typeof mqtt === 'undefined') { console.warn('mqtt lib 未加载'); return; }
-    try {
-      client = mqtt.connect(BROKER, { clientId: 'wb_' + rand() + Date.now(), clean: true, connectTimeout: 8000, reconnectPeriod: 3000 });
-      client.on('connect', () => {
-        client.subscribe('shop/' + room + '/state', { qos: 0 });
+    clients = BROKERS.map(b => {
+      let cli = null;
+      try {
+        cli = mqtt.connect(b.url, { clientId: 'wb_' + rand() + Date.now(), clean: true, connectTimeout: 8000, reconnectPeriod: 3000 });
+      } catch (e) { cli = null; }
+      const rec = { name: b.name, url: b.url, cli, connected: false };
+      if (!cli) return rec;
+      cli.on('connect', () => {
+        rec.connected = true;
+        try { cli.subscribe('shop/' + room + '/state', { qos: 0 }); } catch (e) {}
         /* 关键：不立刻上传。MQTT 的保留消息会在订阅后稍晚送达，
            若此刻抢先上传本机（可能已落后）的数据，就会把线上整包覆盖 —— 这是 9/8 事故的根因。
-           改为：等线上留存到达（或最多等 3 秒）再上传，且上传前会先并回本机缺失的数据。 */
-        pendingConnectPublish = () => {
-          if (!state) return;
-          buildOutgoing();
-          if (client && client.connected) client.publish('shop/' + room + '/state', JSON.stringify(state), { retain: true });
-          if (updateCb) updateCb();
-        };
-        connectPublishTimer = setTimeout(() => {
-          if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; f(); }
-        }, 3000);
+           改为：等线上留存到达（或最多等 3 秒）再上传，且上传前会先并回本机缺失的数据。
+           多 broker 下只排一次队（哪家先到都一样），避免重复上传。 */
+        if (!pendingConnectPublish) {
+          pendingConnectPublish = () => {
+            if (!state) return;
+            buildOutgoing();
+            const n = publishAll();
+            if (n > 0) { unsynced = false; }
+            if (updateCb) updateCb();
+          };
+          connectPublishTimer = setTimeout(() => {
+            if (pendingConnectPublish) { const f = pendingConnectPublish; pendingConnectPublish = null; f(); }
+          }, 3000);
+        }
         if (updateCb) updateCb();
       });
-      client.on('message', (topic, message) => { if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString()); });
-      client.on('error', () => {});
-      client.on('close', () => {});
+      cli.on('message', (topic, message) => { if (topic === 'shop/' + room + '/state') mergeIncoming(message.toString()); });
+      cli.on('error', () => {});
+      cli.on('close', () => { rec.connected = false; });
+      cli.on('offline', () => { rec.connected = false; });
+      return rec;
+    });
+    /* 未同步自动重试：店里信号差时，登记完没发出去，恢复网络后 20 秒内自动补传 */
+    try {
+      if (retryTimer) clearInterval(retryTimer);
+      if (typeof setInterval === 'function') {
+        retryTimer = setInterval(() => {
+          if (unsynced && state && anyConnected()) { publishState(); }
+        }, 20000);
+        /* Node 环境下（单元测试）要 unref，否则定时器会吊住事件循环导致进程不退出；
+           浏览器里 timer 没有 unref 方法，需先判断存在性。 */
+        if (retryTimer && typeof retryTimer.unref === 'function') retryTimer.unref();
+      }
     } catch (e) {}
   }
 
@@ -706,7 +761,7 @@ window.DB = (function () {
     return state;
   }
   function getRoom() { return room; }
-  function isConnected() { return !!(client && client.connected); }
+  function isConnected() { return anyConnected(); }
 
   /* ----------------------------- Excel 导出（SheetJS） ----------------------------- */
   function buildExportRows(recs, user) {
@@ -783,13 +838,30 @@ window.DB = (function () {
       room,
       version: (state && state.version) || 0,
       ts: (state && state.ts) || 0,
-      connected: !!(client && client.connected),
+      connected: anyConnected(),
+      brokers: clients.map(c => ({ name: c.name, connected: !!c.connected })),
+      brokerOk: clients.filter(c => c.connected).length,
+      brokerTotal: clients.length,
+      unsynced,                          // 有改动没发出去（信号差时会是 true）
+      unsyncedSince: unsyncedSince || 0,
+      lastPublishAt: lastPublishAt || 0,
       recordCount: recs.length,
       memberCount: mems.length,
       firstDate: dates[0] || '',
       lastDate: dates[dates.length - 1] || '',
       recentDates: Object.keys(byDate).sort().slice(-7).map(d => d + '(' + byDate[d] + ')'),
       guard: getGuardInfo()
+    };
+  }
+  /* 供界面顶部横幅使用：本机是否有改动没能发到线上 */
+  function getUnsyncedInfo() {
+    return {
+      unsynced,
+      since: unsyncedSince || 0,
+      lastPublishAt: lastPublishAt || 0,
+      connected: anyConnected(),
+      brokerOk: clients.filter(c => c.connected).length,
+      brokerTotal: clients.length
     };
   }
   /* --------------------- 无效/演示数据扫描与清理 --------------------- */
@@ -861,8 +933,9 @@ window.DB = (function () {
   function forcePushLocal(opts) {
     if (!state) return false;
     buildOutgoing();                       // 同样先自检：本机落后的部分会先从线上补回，不会误伤
-    if (client && client.connected) { client.publish('shop/' + room + '/state', JSON.stringify(state), { qos: 0, retain: true }); return true; }
-    return false;
+    const sent = publishAll();             // 3 家全发，任意一家通就算成功
+    if (sent > 0) unsynced = false;
+    return sent > 0;
   }
   /* 供「数据体检」展示：最近一次上传前自检情况 */
   function getGuardInfo() {
@@ -881,6 +954,6 @@ window.DB = (function () {
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
-    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds
+    getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo
   };
 })();
