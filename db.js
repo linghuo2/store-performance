@@ -40,6 +40,7 @@ window.DB = (function () {
   let partManifest = '';       // 当前目录原文（用于三家 broker 重复投递时去重）
   let lastOkManifest = '';     // 最近一次成功组装并合并的目录
   let lastPartCount = 0;       // 上次发布用了几片（用于清除残留的过期分片）
+  let publishSeq = 0;          // 发布序号：分片是限速异步发的，新发布要让旧的半截作废
 
   /* ---- 反向覆盖防护（旧设备持旧数据上线会把线上整包盖掉，2026-09-08 事故后加） ---- */
   let remoteShadow = null;       // 最近一次收到的「线上完整数据」快照（原始，未与本机合并）
@@ -698,25 +699,29 @@ window.DB = (function () {
   function publishPayload(payload) {
     const parts = payload.length > SAFE_MAX ? splitPayload(payload) : null;
     const want = parts ? parts.length : 0;
+    const seq = ++publishSeq;            // 分片是异步发的，期间若又有新改动，旧的那批要作废
     let sent = 0;
-    clients.forEach(c => {
-      if (!c.cli || !c.connected) return;
-      try {
-        if (!parts) {
-          c.cli.publish(baseTopic(), payload, { qos: 0, retain: true });
-        } else {
-          c.cli.publish(baseTopic(), SPLIT_PREFIX + parts.length + ':' + payload.length, { qos: 0, retain: true });
-          parts.forEach((p, i) => { c.cli.publish(partTopic(i), p, { qos: 0, retain: true }); });
-        }
-        sent++;
-      } catch (e) {}
-    });
+    const live = () => clients.filter(c => c.cli && c.connected);
+    if (!parts) {
+      live().forEach(c => { try { c.cli.publish(baseTopic(), payload, { qos: 0, retain: true }); sent++; } catch (e) {} });
+    } else {
+      live().forEach(c => {
+        try { c.cli.publish(baseTopic(), SPLIT_PREFIX + parts.length + ':' + payload.length, { qos: 0, retain: true }); sent++; }
+        catch (e) {}
+      });
+      /* 限速逐片发：一口气推十几片大消息会被 broker 丢掉（实测丢 3 片），必须间隔 */
+      const targets = live();
+      parts.forEach((p, i) => {
+        setTimeout(() => {
+          if (seq !== publishSeq) return;               // 已有更新的发布，放弃这次半截的
+          targets.forEach(c => { try { c.cli.publish(partTopic(i), p, { qos: 0, retain: true }); } catch (e) {} });
+        }, i * PART_DELAY);
+      });
+    }
     /* 数据变小、片数变少时，把上一版残留的多余分片清掉（发空 retain 是 MQTT 标准的清除方式），
        否则下次片数重新变多时，可能拼进一个过期分片 —— 但即使拼错，长度校验也会拦下。 */
-    for (let i = want; i < lastPartCount; i++) {
-      clients.forEach(c => {
-        if (c.cli && c.connected) { try { c.cli.publish(partTopic(i), '', { qos: 0, retain: true }); } catch (e) {} }
-      });
+    for (let i = want; i < lastPartCount; i++) {   // 空消息很小，不会被丢，无需限速
+      live().forEach(c => { try { c.cli.publish(partTopic(i), '', { qos: 0, retain: true }); } catch (e) {} });
     }
     lastPartCount = want;
     return sent;
@@ -792,6 +797,10 @@ window.DB = (function () {
      每片都远低于 60KB，永远不会触发 broker 的静默丢弃。 */
   const SPLIT_PREFIX = 'GZ2:';
   const CHUNK = 48000;
+  /* 逐片间隔：实测（.workbuddy/probe_split.js）连续快速推送多片 47KB 消息时，
+     EMQX 会丢片（18 片只收到 15 片）—— 不是分片方案不行，是发太快。
+     加 150ms 间隔后三家全部收全 18 片、4000 条还原无损。别把这个值改小。 */
+  const PART_DELAY = 150;
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
   function bytesToB64(u8) {      // 手写 base64：不依赖 btoa，分块处理避免大数组爆栈
