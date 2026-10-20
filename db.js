@@ -1033,7 +1033,7 @@ window.DB = (function () {
       const rate = Number(st.commissionRate) || 0;
       const fixed = Number(st.commissionFixed) || 0;
       const cells = [r.date];
-      if (isBossLike) cells.push(r.storeName || st.name || '');
+      if (isBossLike) cells.push(st.name || r.storeName || '');   // 档案优先，快照只作兜底
       if (user.role !== 'clerk') cells.push(r.clerkName);
       cells.push(r.category || '', r.subCategory || '', r.payMethod || '', r.amount, rate, fixed, r.commission, r.note || '');
       rows.push(cells);
@@ -1080,6 +1080,159 @@ window.DB = (function () {
     XLSX.utils.book_append_sheet(wb, ws, '会员信息');
     const tag = (user && user.role === 'manager') ? (user.storeName || '本店') : '全部';
     XLSX.writeFile(wb, '会员信息_' + tag + '.xlsx');
+  }
+
+  /* ----------------------------- 月度 Excel 月报 ----------------------------- */
+  /* 界面上看到的和导出的 Excel 用的是同一份 buildMonthlySheets 结果，避免「屏幕上一个数、表格里另一个数」。
+     月报只认自己的时间区间（opts.from / opts.to），不接顶部的经营总览筛选。 */
+  const ROLE_CN = { boss: '老板', regional: '区域经理', manager: '店长', clerk: '店员' };
+  const WEEK_CN_ = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  function pct(n, total) { return total > 0 ? Math.round((n / total) * 1000) / 10 : 0; }
+  function safeName(s) { return String(s == null ? '' : s).replace(/[\\/:*?"<>|\r\n]/g, '_').trim(); }
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function ymd_(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+
+  /* 月报文件名：正好一整天 → 月报_2026-10-20；正好一整月 → 月报_2026-10；否则 → 月报_起_至 */
+  function reportFileName(opts) {
+    const o = opts || {};
+    const scope = safeName(o.scope || '');
+    const head = '月报' + (scope ? '_' + scope : '');
+    const f = o.from || '', t = o.to || '';
+    if (f && f === t) return head + '_' + f + '.xlsx';
+    if (f && t && f.slice(0, 7) === t.slice(0, 7) && f.slice(8) === '01' && isMonthEnd(t)) {
+      return head + '_' + f.slice(0, 7) + '.xlsx';
+    }
+    if (f && t) return head + '_' + f + '_至_' + t + '.xlsx';
+    return head + '_全部.xlsx';
+  }
+  function isMonthEnd(iso) {
+    const p = String(iso).split('-').map(Number);
+    if (p.length < 3) return false;
+    return new Date(p[0], p[1], 0).getDate() === p[2];
+  }
+
+  function buildMonthlySheets(recs, user, opts) {
+    const o = opts || {}, u = user || {};
+    const list = (recs || []).filter(r => r && (r.date || '').slice(0, 10));
+    const isBossLike = (u.role === 'boss' || u.role === 'regional');
+    /* 门店名以 storeId 查档案为准，记录里的 storeName 只是兜底快照
+       （老数据/演示数据里残留过旧店名，直接信快照会把门店名显示错） */
+    const storeNameOf = r => {
+      const st = getStore(r.storeId) || {};
+      return (st.name || r.storeName || '');
+    };
+
+    const count = list.length;
+    const sales = list.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+    const commission = list.reduce((a, r) => a + (Number(r.commission) || 0), 0);
+    const avg = count ? sales / count : 0;
+
+    /* 按日 */
+    const dayMap = {};
+    list.forEach(r => {
+      const d = (r.date || '').slice(0, 10);
+      if (!dayMap[d]) dayMap[d] = { count: 0, sales: 0, commission: 0 };
+      dayMap[d].count++;
+      dayMap[d].sales += Number(r.amount) || 0;
+      dayMap[d].commission += Number(r.commission) || 0;
+    });
+    const dayKeys = Object.keys(dayMap).sort();
+    const byDay = {
+      header: ['日期', '星期', '笔数', '业绩', '提成', '客单价'],
+      rows: dayKeys.map(d => {
+        const p = String(d).split('-').map(Number);
+        const w = (p.length >= 3) ? WEEK_CN_[new Date(p[0], p[1] - 1, p[2]).getDay()] : '';
+        const v = dayMap[d];
+        return [d, w, v.count, v.sales, v.commission, v.count ? v.sales / v.count : 0];
+      })
+    };
+    let best = null;
+    dayKeys.forEach(d => { if (!best || dayMap[d].sales > best.sales) best = { date: d, sales: dayMap[d].sales }; });
+
+    /* 按员工 */
+    const staffMap = {};
+    list.forEach(r => {
+      const k = r.clerkId || '__' + (r.clerkName || '未署名');
+      if (!staffMap[k]) staffMap[k] = { name: r.clerkName || '未署名', store: storeNameOf(r), count: 0, sales: 0, commission: 0 };
+      staffMap[k].count++;
+      staffMap[k].sales += Number(r.amount) || 0;
+      staffMap[k].commission += Number(r.commission) || 0;
+    });
+    const byStaff = {
+      header: isBossLike ? ['员工', '门店', '笔数', '业绩', '提成', '业绩占比(%)'] : ['员工', '笔数', '业绩', '提成', '业绩占比(%)'],
+      rows: Object.keys(staffMap).map(k => staffMap[k]).sort((a, b) => b.sales - a.sales).map(v => {
+        const base = isBossLike ? [v.name, v.store, v.count, v.sales, v.commission, pct(v.sales, sales)]
+          : [v.name, v.count, v.sales, v.commission, pct(v.sales, sales)];
+        return base;
+      })
+    };
+
+    /* 按大类 / 按支付方式 */
+    const groupBy = key => {
+      const m = {};
+      list.forEach(r => { const k = String(r[key] || '未填写'); m[k] = m[k] || { count: 0, sales: 0 }; m[k].count++; m[k].sales += Number(r.amount) || 0; });
+      return {
+        header: ['项目', '笔数', '业绩', '业绩占比(%)'],
+        rows: Object.keys(m).map(k => [k, m[k].count, m[k].sales, pct(m[k].sales, sales)]).sort((a, b) => b[2] - a[2])
+      };
+    };
+    const byCat = groupBy('category');
+    const byPay = groupBy('payMethod');
+
+    const storeSet = new Set(list.map(storeNameOf).filter(Boolean));
+    const nowD = new Date();
+    const label = o.label || ((o.from || o.to) ? [o.from, o.to].filter(Boolean).join(' 至 ') : '全部日期');
+    const overview = [
+      ['统计区间', label],
+      ['导出时间', ymd_(nowD) + ' ' + pad2(nowD.getHours()) + ':' + pad2(nowD.getMinutes())],
+      ['导出人', (u.name || '') + (ROLE_CN[u.role] ? '（' + ROLE_CN[u.role] + '）' : '')],
+      ['登记笔数', count],
+      ['业绩合计', sales],
+      ['提成合计', commission],
+      ['客单价', avg],
+      ['有登记天数', dayKeys.length],
+      ['日均业绩', dayKeys.length ? sales / dayKeys.length : 0],
+      ['最高单日', best ? (best.date + '（' + best.sales + '）') : '—'],
+      ['涉及员工数', Object.keys(staffMap).length],
+      ['涉及门店数', storeSet.size]
+    ];
+
+    return {
+      meta: {
+        from: o.from || '', to: o.to || '', label,
+        count, sales, commission, avg,
+        days: dayKeys.length,
+        avgByDay: dayKeys.length ? sales / dayKeys.length : 0,
+        best, staffCount: Object.keys(staffMap).length, storeCount: storeSet.size
+      },
+      overview,
+      detail: buildExportRows(list, u),
+      byDay, byStaff, byCat, byPay
+    };
+  }
+
+  async function exportMonthlyReport(recs, user, opts) {
+    const ok = await ensureXLSX();
+    if (!ok) { alert('Excel 导出组件加载失败，请检查网络后重试'); return false; }
+    const o = opts || {};
+    const data = buildMonthlySheets(recs, user, o);
+    const wb = XLSX.utils.book_new();
+
+    const push = (name, rows, widths) => {
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      if (widths) ws['!cols'] = widths.map(w => ({ wch: w }));
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    };
+    /* 概览：标题 + 指标两列，金额列给足宽度避免显示成 #### */
+    push('月报概览', [['门店业绩月报'], []].concat(data.overview), [{ wch: 14 }, { wch: 26 }]);
+    push('业绩明细', data.detail, [{ wch: 12 }, { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 24 }]);
+    push('按日汇总', [data.byDay.header].concat(data.byDay.rows), [{ wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 12 }]);
+    push('员工汇总', [data.byStaff.header].concat(data.byStaff.rows), [{ wch: 12 }, { wch: 14 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 12 }]);
+    push('大类汇总', [data.byCat.header].concat(data.byCat.rows), [{ wch: 16 }, { wch: 8 }, { wch: 14 }, { wch: 12 }]);
+    push('支付方式汇总', [data.byPay.header].concat(data.byPay.rows), [{ wch: 16 }, { wch: 8 }, { wch: 14 }, { wch: 12 }]);
+
+    XLSX.writeFile(wb, reportFileName(o));
+    return true;
   }
 
   /* ----------------------------- 同步体检 / 数据抢救 ----------------------------- */
@@ -1210,6 +1363,7 @@ window.DB = (function () {
     getDB, computeSummary, accessibleStores, filterRecords, filterUsers, accessibleRegions, getStore, findSubCategory, calcCommission, publicUser,
     addRegion, deleteRegion, addStore, updateStore, deleteStore, addUser, updateUser, deleteUser, addRecord, updateRecord, deleteRecord,
     addCategory, renameCategory, deleteCategory, setSubs, buildExportRows, exportXLSX, exportMembers,
+    buildMonthlySheets, exportMonthlyReport, reportFileName,
     addMember, updateMember, rechargeMember, deleteMember, getMembers,
     getSyncInfo, forcePushLocal, getGuardInfo, scanJunk, removeUsersByIds, getUnsyncedInfo, sendHello,
     packPayload, unpackPayload, getPayloadInfo,
