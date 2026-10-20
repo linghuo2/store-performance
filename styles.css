@@ -102,6 +102,21 @@ table.editable tr.dirty td { background: #fff8e6; }
 
 .export-bar .exp-label { font-size: 13.5px; font-weight: 600; color: var(--ink); }
 
+/* 月度 Excel 月报：筛选条 + 概览 + 分组表 */
+.rep-bar { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; background: #fffaf2; border: 1px solid #ffe3bd; border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; }
+.rep-bar .tb-label { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+.rep-bar input[type="date"] { padding: 5px 9px; font-size: 13px; border-radius: 8px; border: 1px solid var(--line); background: #fff; color: var(--ink); }
+.rep-bar input[type="date"]:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(47,107,255,.12); }
+.rep-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 20px; background: #fafbfc; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: var(--sub); }
+.rep-head b { color: var(--ink); font-weight: 600; }
+.rep-cards { margin-bottom: 16px; }
+.rep-block { margin-bottom: 18px; }
+.rep-block h3 { font-size: 14px; font-weight: 600; color: var(--ink); margin: 0 0 8px; }
+.rep-block h3 .rp-note { margin-left: 8px; font-weight: 400; font-size: 12px; color: var(--sub); }
+.rep-row { display: flex; flex-wrap: wrap; gap: 16px; }
+.rep-row .rep-block.half { flex: 1 1 320px; min-width: 260px; margin-bottom: 0; }
+.rep-empty { background: #fffaeb; border: 1px solid #fedf89; color: #b54708; border-radius: 10px; padding: 16px; font-size: 13.5px; }
+
 /* 经营总览时间筛选条 */
 .time-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: #f7f9ff; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; }
 .time-bar .tb-label { font-size: 13.5px; font-weight: 600; color: var(--ink); }
@@ -284,8 +299,10 @@ table.editable tbody tr:hover { background: #fbfcff; }
   .share-card { flex-wrap: wrap; }
   .share-card .sc-url { width: 100%; }
 
-  .export-bar, .time-bar { gap: 8px; }
-  .export-bar .exp-label, .time-bar .tb-label { width: 100%; }
+  .export-bar, .time-bar, .rep-bar { gap: 8px; }
+  .export-bar .exp-label, .time-bar .tb-label, .rep-bar .tb-label { width: 100%; }
+  .rep-row { gap: 16px; }
+  .rep-row .rep-block.half { flex: 1 1 100%; min-width: 0; margin-bottom: 16px; }
 
   table { font-size: 12.5px; }
   th, td { padding: 8px 9px; }
