@@ -9,7 +9,6 @@ const app = () => document.getElementById('app');
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const money = n => '¥' + Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const today = () => new Date().toISOString().slice(0, 10);
-const curMonth = () => new Date().toISOString().slice(0, 7);
 const roleName = r => ({ boss: '老板', regional: '区域经理', manager: '店长', clerk: '店员' }[r] || r);
 
 /* 全局错误兜底：任何未捕获错误都显示到页面，避免“整页白屏”无信息 */
@@ -146,6 +145,8 @@ setInterval(updateSyncWarn, 4000);
 /* ----------------------------- 登录 ----------------------------- */
 async function doLogin(username, password) {
   timeRange.mode = 'all'; timeRange.from = ''; timeRange.to = ''; timeRange.month = '';
+  /* 每次登录都回到「今天」，避免上一个人选的范围（如上月）留给下一个登录的人 */
+  repRange.mode = 'today'; repRange.from = repRange.to = today();
   /* 首次打开/新设备扫码时，线上账号数据可能还在同步，先给个提示别让用户以为卡住 */
   const btn = $('#lgBtn');
   const oldText = btn ? btn.textContent : '';
@@ -245,13 +246,144 @@ function render() {
   else renderClerk();
 }
 
-/* --------------------- 导出月报工具条 --------------------- */
-function exportBarHTML() {
-  return `<div class="export-bar">
-    <span class="exp-label">📊 月度 Excel 月报</span>
-    <input type="month" id="expMonth" value="${curMonth()}" />
-    <button class="btn sm" data-action="export-xlsx">导出当前月份</button>
+/* --------------------- 月度 Excel 月报 --------------------- */
+/* 界面默认只显示【今天】：以前是一个「选月份 → 导出」的工具条，屏幕上什么都没有，
+   导出的表格和界面各说各话。现在屏幕先给出当天的结果，想看别的范围用上面的筛选切，
+   Excel 与屏幕共用同一份数据（DB.buildMonthlySheets），所见即所得。
+   注意：月报只认自己的 repRange，不接顶部的「经营总览时间筛选」——
+   否则顶部选了「本月」，月报里就查不到其它日期了（这个坑以前踩过）。 */
+const REP_RANGES = [['today', '今天'], ['yesterday', '昨天'], ['7', '近 7 天'], ['30', '近 30 天'],
+  ['month', '本月'], ['lastMonth', '上月'], ['all', '全部']];
+const repRange = { mode: 'today', from: today(), to: today() };
+const REP_DAY_LIMIT = 60;          // 按日汇总最多显示多少行，防止「全部」铺出几百行
+
+function repRecords() {
+  const f = repRange.from, t = repRange.to;
+  return (cache.records || []).filter(r => {
+    const d = (r.date || '').slice(0, 10);
+    if (f && d < f) return false;
+    if (t && d > t) return false;
+    return true;
+  });
+}
+/* 文件名上的范围标签：让老板一眼看出这份表是全店的还是某个大区/门店的 */
+function repScope() {
+  if (!me) return '';
+  if (me.role === 'boss') return '全部门店';
+  if (me.role === 'regional') return (cache.regions[0] && cache.regions[0].name) || '本大区';
+  if (me.role === 'manager') return (cache.stores[0] && cache.stores[0].name) || me.storeName || '本店';
+  return (me.name || '') + '个人';
+}
+function applyRepPreset(p) {
+  repRange.mode = p;
+  const t = new Date();
+  if (p === 'today') { repRange.from = repRange.to = ymdOf(t); }
+  else if (p === 'yesterday') { repRange.from = repRange.to = ymdOf(new Date(t.getTime() - 86400000)); }
+  else if (p === '7' || p === '30') { repRange.to = ymdOf(t); repRange.from = addDaysISO(repRange.to, -(parseInt(p, 10) - 1)); }
+  else if (p === 'month') { const [a, b] = monthBoundsOf(t.getFullYear(), t.getMonth()); repRange.from = a; repRange.to = b; }
+  else if (p === 'lastMonth') { const [a, b] = monthBoundsOf(t.getFullYear(), t.getMonth() - 1); repRange.from = a; repRange.to = b; }
+  else { repRange.from = ''; repRange.to = ''; }
+  syncRepInputs();
+  refreshMonthlyReport();
+}
+function syncRepInputs() {
+  const f = $('#repFrom'), t = $('#repTo');
+  if (f) f.value = repRange.from;
+  if (t) t.value = repRange.to;
+}
+function applyRepCustom() {
+  repRange.from = ($('#repFrom') && $('#repFrom').value) || '';
+  repRange.to = ($('#repTo') && $('#repTo').value) || '';
+  repRange.mode = 'custom';
+  refreshMonthlyReport();
+}
+/* 筛选条是静态的，刷新时只替换 #monthlyReportWrap，避免日期输入框失焦 */
+function repFilterBarHTML() {
+  return `<div class="rep-bar">
+    <span class="tb-label">报表范围</span>
+    ${REP_RANGES.map(([v, t]) => `<button class="btn sm${repRange.mode === v ? '' : ' ghost'}" data-action="rep-preset" data-preset="${v}">${t}</button>`).join('')}
+    <input type="date" id="repFrom" value="${repRange.from}" title="开始日期" />
+    <span>至</span>
+    <input type="date" id="repTo" value="${repRange.to}" title="结束日期" />
+    <button class="btn sm" data-action="rep-apply">应用区间</button>
+    <button class="btn sm warn" data-action="export-monthly">📥 导出 Excel 月报</button>
   </div>`;
+}
+function monthlyReportHTML() {
+  const data = DB.buildMonthlySheets(repRecords(), me, { from: repRange.from, to: repRange.to });
+  const m = data.meta;
+  if (!m.count) {
+    return `<div class="rep-empty">「${esc(m.label)}」这个范围内还没有登记记录。换一个范围试试，或先去上方登记业绩。</div>`;
+  }
+  const cards = `<div class="cards rep-cards">
+    <div class="kpi gray"><div class="label">登记笔数</div><div class="val">${m.count}</div></div>
+    <div class="kpi"><div class="label">业绩合计</div><div class="val">${money(m.sales)}</div></div>
+    <div class="kpi green"><div class="label">提成合计</div><div class="val">${money(m.commission)}</div></div>
+    <div class="kpi amber"><div class="label">客单价</div><div class="val">${money(m.avg)}</div></div>
+    <div class="kpi gray"><div class="label">有登记天数</div><div class="val">${m.days}</div></div>
+    <div class="kpi gray"><div class="label">日均业绩</div><div class="val">${money(m.avgByDay)}</div></div>
+  </div>`;
+
+  const dayRows = data.byDay.rows.slice(-REP_DAY_LIMIT);
+  const dayHidden = data.byDay.rows.length - dayRows.length;
+  const dayTable = `<div class="rep-block">
+    <h3>按日汇总${dayHidden > 0 ? `<span class="rp-note">仅显示最近 ${REP_DAY_LIMIT} 天（共 ${data.byDay.rows.length} 天），导出 Excel 含全部</span>` : ''}</h3>
+    <div class="tbl-scroll"><table>
+      <thead><tr>${data.byDay.header.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody>${dayRows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]} 笔</td><td class="c-amount">${money(r[3])}</td><td class="c-comm">${money(r[4])}</td><td>${money(r[5])}</td></tr>`).join('')}</tbody>
+    </table></div></div>`;
+
+  const bossLike = data.byStaff.header.length === 6;
+  const staffTable = (me && me.role === 'clerk') ? '' : `<div class="rep-block">
+    <h3>员工汇总</h3>
+    <div class="tbl-scroll"><table>
+      <thead><tr>${data.byStaff.header.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody>${data.byStaff.rows.map(r => bossLike
+        ? `<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td>${r[2]} 笔</td><td class="c-amount">${money(r[3])}</td><td class="c-comm">${money(r[4])}</td><td>${r[5]}%</td></tr>`
+        : `<tr><td>${esc(r[0])}</td><td>${r[1]} 笔</td><td class="c-amount">${money(r[2])}</td><td class="c-comm">${money(r[3])}</td><td>${r[4]}%</td></tr>`).join('')}</tbody>
+    </table></div></div>`;
+
+  const kvTable = (title, d) => `<div class="rep-block half">
+    <h3>${title}</h3>
+    <div class="tbl-scroll"><table>
+      <thead><tr>${d.header.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody>${d.rows.map(r => `<tr><td>${esc(r[0])}</td><td>${r[1]} 笔</td><td class="c-amount">${money(r[2])}</td><td>${r[3]}%</td></tr>`).join('')}</tbody>
+    </table></div></div>`;
+
+  return `<div class="rep-head">
+      <span>当前范围 <b>${esc(m.label)}</b></span>
+      <span>最高单日 <b>${m.best ? esc(m.best.date) + ' ' + money(m.best.sales) : '—'}</b></span>
+      <span>涉及员工 <b>${m.staffCount}</b> 人</span>
+      <span>涉及门店 <b>${m.storeCount}</b> 家</span>
+    </div>
+    ${cards}
+    ${dayTable}
+    ${staffTable}
+    <div class="rep-row">${kvTable('大类汇总', data.byCat)}${kvTable('支付方式汇总', data.byPay)}</div>`;
+}
+function monthlyReportSectionHTML() {
+  return `<div class="section">
+    <h2>月度 Excel 月报 <span class="tag">默认显示今天 · 其他范围用上方筛选 · 界面与导出一致</span></h2>
+    ${repFilterBarHTML()}
+    <div id="monthlyReportWrap">${monthlyReportHTML()}</div>
+  </div>`;
+}
+function refreshMonthlyReport() {
+  const wrap = document.getElementById('monthlyReportWrap');
+  if (wrap) wrap.innerHTML = monthlyReportHTML();
+  const btns = document.querySelectorAll('[data-action="rep-preset"]');
+  if (btns && btns.forEach) btns.forEach(b => { b.className = 'btn sm' + (b.dataset.preset === repRange.mode ? '' : ' ghost'); });
+}
+async function exportMonthly() {
+  const recs = repRecords();
+  if (!recs.length) return toast('当前报表范围没有记录可导出', true);
+  const opts = { from: repRange.from, to: repRange.to, scope: repScope() };
+  const file = DB.reportFileName ? DB.reportFileName(opts) : '月报.xlsx';
+  let ok = false;
+  try { ok = await DB.exportMonthlyReport(recs, me, opts); }
+  catch (e) { return toast('导出失败：' + ((e && e.message) || e), true); }
+  if (ok) toast('已导出 ' + file + '（' + recs.length + ' 笔 · 6 张表）');
+  else toast('导出失败：Excel 组件没加载成功，请检查网络后重试', true);
 }
 
 /* --------------------- 业绩明细筛选（员工 / 日期） --------------------- */
@@ -320,6 +452,9 @@ function renderRecordViews() {
   if (clerkBox) { clerkBox.innerHTML = recordsTable(recs); return; }
   const box = $('#bossRecords') || $('#mgrRecords');
   if (box) box.innerHTML = editableRecordsTable(recs);
+  /* 新增/删除/编辑记录后顺带刷新月报（登记完不会走整页 render）。
+     用 typeof 兜底：单元测试只抽取筛选代码段时没有这个函数，不能因此报错。 */
+  if (typeof refreshMonthlyReport === 'function') refreshMonthlyReport();
 }
 
 function applyRecFilter() {
@@ -537,13 +672,6 @@ function applyCustomRange() {
   timeRange.to = ($('#rangeTo') && $('#rangeTo').value) || '';
   timeRange.month = '';
   applyRange();
-}
-async function exportXLSX(month) {
-  try {
-    const recs = month ? cache.records.filter(r => (r.date || '').slice(0, 7) === month) : cache.records.slice();
-    DB.exportXLSX(recs, me, month);
-    toast('已导出 业绩月报_' + (month || '全部') + '.xlsx');
-  } catch (e) { toast('导出失败', true); }
 }
 async function exportMembersXLSX() {
   try {
@@ -926,6 +1054,9 @@ document.addEventListener('change', e => {
   if (e.target && e.target.id === 'dailyRange') {
     dailyRange = e.target.value;
     refreshDailySummary();
+  }
+  if (e.target && (e.target.id === 'repFrom' || e.target.id === 'repTo')) {
+    applyRepCustom();
   }
 });
 
@@ -1367,9 +1498,10 @@ function renderBoss() {
       <h2>业绩明细管理 <span class="tag">可直接修改日期 / 归属 / 大类 / 金额（实时同步）</span></h2>
       ${bossAddRecordHTML()}
       ${recFilterBarHTML()}
-      ${exportBarHTML()}
       <div id="bossRecords"></div>
     </div>
+
+    ${monthlyReportSectionHTML()}
 
     <div class="section">
       <h2>人员管理 <span class="tag">${isBoss ? '全部账号（含多老板/区域经理）' : '本大区账号'}</span></h2>
@@ -1588,7 +1720,6 @@ function renderManager() {
 
     <div class="section">
       <h2>门店业绩登记 <span class="tag">仅本门店</span></h2>
-      ${exportBarHTML()}
       <div class="row-actions" style="margin-bottom:14px;">
         <div class="field"><label>店员</label><select id="mrClerk"></select></div>
         <div class="field"><label>日期</label><input id="mrDate" type="date" value="${today()}" /></div>
@@ -1604,6 +1735,8 @@ function renderManager() {
       ${recFilterBarHTML()}
       <div id="mgrRecords"></div>
     </div>
+
+    ${monthlyReportSectionHTML()}
 
     ${membersSectionHTML()}
 
@@ -1648,7 +1781,6 @@ function renderClerk() {
     </div>
     <div class="section">
       <h2>登记我的业绩</h2>
-      ${exportBarHTML()}
       <div class="row-actions" style="margin-bottom:14px;">
         <div class="field"><label>日期</label><input id="crDate" type="date" value="${today()}" /></div>
         <div class="field"><label>大类</label><select id="crCat">${catOptionsHTML()}</select></div>
@@ -1662,7 +1794,9 @@ function renderClerk() {
       <div id="crCommissionHint" class="commission-hint"></div>
       ${recFilterBarHTML({ staff: false })}
       <div id="clerkRecords"></div>
-    </div>`;
+    </div>
+
+    ${monthlyReportSectionHTML()}`;
   bindMemberToggle('crPay', 'crMemberRow', 'crMember', 'crSub', 'crCat', 'crAmount');
   renderRecordViews();
 }
@@ -1680,9 +1814,16 @@ document.addEventListener('click', async e => {
     updateSyncWarn();
     return;
   }
-  if (action === 'export-xlsx') {
-    const m = $('#expMonth') ? $('#expMonth').value : '';
-    await exportXLSX(m);
+  if (action === 'export-monthly') {
+    await exportMonthly();
+    return;
+  }
+  if (action === 'rep-preset') {
+    applyRepPreset(btn.dataset.preset);
+    return;
+  }
+  if (action === 'rep-apply') {
+    applyRepCustom();
     return;
   }
   if (action === 'export-filtered') {
