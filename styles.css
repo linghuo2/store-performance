@@ -137,6 +137,17 @@ table.editable tr.dirty td { background: #fff8e6; }
 .daily-chk input { width: 15px; height: 15px; cursor: pointer; }
 .daily-warn { background: #fff5f5; border: 1px solid #ffd9db; color: #b42318; border-radius: 10px; padding: 10px 14px; font-size: 12.5px; line-height: 1.9; margin-bottom: 12px; }
 tr.daily-miss td { color: var(--sub); background: #fffafa; }
+/* 有登记的日期可点击下钻到当天明细 */
+tr.daily-row { cursor: pointer; transition: background .12s; }
+tr.daily-row:hover td { background: #f2f7ff; }
+tr.daily-row .drill-hint { font-style: normal; font-weight: 700; margin-left: 2px; opacity: .45; }
+tr.daily-row:hover .drill-hint { opacity: 1; color: var(--brand); }
+tr.daily-sel td { background: #eaf0ff; }
+tr.daily-sel td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
+.daily-range select {
+  border: 1px solid var(--line); border-radius: 7px; padding: 4px 8px;
+  font-size: 12.5px; color: var(--ink); background: #fff; cursor: pointer;
+}
 .badge-ok { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11.5px; background: #e9f7f1; color: #067647; }
 .room-badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11.5px; font-weight:600; letter-spacing:.2px; vertical-align:middle; }
 .room-badge.ok { background:#e7f4ee; color:#04663c; border:1px solid #b6e2ce; }
