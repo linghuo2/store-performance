@@ -799,6 +799,11 @@ function categoryBreakdownHTML(byCategory) {
 
 /* --------------------- 每日汇总（一眼看出哪天漏登记） --------------------- */
 let dailyOnlyMissing = false;
+/* 汇总默认只显示近 10 天（以前默认铺开最多 180 行，找今天的记录要滚很久）。
+   这里的范围只服务每日汇总，与顶部「经营总览时间筛选」是两套东西，互不干扰。 */
+let dailyRange = '10';
+let dailyDrillDate = '';         // 当前正在查看的那天（用于表格行高亮）
+const DAILY_RANGES = [['7', '近 7 天'], ['10', '近 10 天'], ['30', '近 30 天'], ['month', '本月'], ['all', '全部']];
 const WEEK_CN = ['日', '一', '二', '三', '四', '五', '六'];
 function addDaysISO(iso, n) {
   const p = String(iso).split('-').map(Number);
@@ -816,12 +821,6 @@ function dailyScopeRecords() {
 }
 function dailySummaryHTML(records) {
   const recs = (records || []).filter(r => (r.date || '').slice(0, 10));
-  if (!recs.length) {
-    return `<div class="section">
-      <h2>每日汇总 <span class="tag">按日期分组 · 红色为漏登记</span></h2>
-      <div class="empty">当前范围内暂无登记记录</div>
-    </div>`;
-  }
   const byDate = {};
   recs.forEach(r => {
     const d = (r.date || '').slice(0, 10);
@@ -831,12 +830,26 @@ function dailySummaryHTML(records) {
     byDate[d].commission += Number(r.commission) || 0;
   });
   const dates = Object.keys(byDate).sort();
-  const first = dates[0];
   const lastReal = dates[dates.length - 1];
-  const endISO = lastReal > today() ? lastReal : today();   // 延伸到今天，才能发现"之后一直没登记"
-  let all = [], cur = first, guard = 0;
+  /* 窗口右端点怎么定，取决于顶部有没有筛时间：
+     - 顶部没筛（全部）→ 延伸到今天，这样才能发现「之后一直没登记」；
+     - 顶部筛了具体区间 → 以该区间内最晚那天为准，否则近 N 天会落到区间外，
+       看到一堆跟筛选毫无关系的「未登记」。 */
+  const hasRange = !!(timeRange && (timeRange.from || timeRange.to || timeRange.month));
+  const endISO = hasRange
+    ? (lastReal || today())
+    : ((lastReal && lastReal > today()) ? lastReal : today());
+
+  /* 窗口左端点：按每日汇总自己的范围选择算，基准是 endISO。
+     这样顶部筛了「上月」时，近 10 天指的是「上月末往前 10 天」，而不是永远盯着今天。 */
+  let startISO;
+  if (dailyRange === 'all') startISO = dates[0] || endISO;
+  else if (dailyRange === 'month') startISO = endISO.slice(0, 8) + '01';
+  else startISO = addDaysISO(endISO, -(parseInt(dailyRange, 10) - 1));
+
+  let all = [], cur = startISO, guard = 0;
   while (cur <= endISO && guard++ < 400) { all.push(cur); cur = addDaysISO(cur, 1); }
-  if (all.length > 180) all = all.slice(all.length - 180);
+  if (dailyRange === 'all' && all.length > 180) all = all.slice(all.length - 180);
   const missDates = all.filter(d => !byDate[d]);
   const activeDates = all.filter(d => byDate[d]);
   const totalSales = activeDates.reduce((s, d) => s + byDate[d].sales, 0);
@@ -851,10 +864,11 @@ function dailySummaryHTML(records) {
       <td>${d}</td><td>周${weekdayOf(d)}</td><td>0 笔</td>
       <td class="c-amount">—</td><td class="c-comm">—</td>
       <td><span class="badge-miss">未登记</span></td></tr>`;
-    return `<tr>
+    const sel = (d === dailyDrillDate) ? ' daily-sel' : '';
+    return `<tr class="daily-row${sel}" data-action="daily-drill" data-date="${d}" title="点击查看 ${d} 当天的明细">
       <td>${d}</td><td>周${weekdayOf(d)}</td><td>${v.count} 笔</td>
       <td class="c-amount">${money(v.sales)}</td><td class="c-comm">${money(v.commission)}</td>
-      <td><span class="badge-ok">已登记</span></td></tr>`;
+      <td><span class="badge-ok">已登记 <i class="drill-hint">›</i></span></td></tr>`;
   }).join('');
   if (!rows.trim()) rows = `<tr><td colspan="6" class="muted">没有漏登记的日期 👍</td></tr>`;
 
@@ -862,9 +876,12 @@ function dailySummaryHTML(records) {
     ? `<div class="daily-warn">以下日期没有任何登记，请核对是否漏录：<br/>${missDates.slice(-40).map(d => d + '（周' + weekdayOf(d) + '）').join('、')}${missDates.length > 40 ? ' 等共 ' + missDates.length + ' 天' : ''}</div>`
     : '';
   return `<div class="section">
-    <h2>每日汇总 <span class="tag">按日期分组 · 红色为漏登记</span></h2>
+    <h2>每日汇总 <span class="tag">按日期分组 · 点击某天看当天明细</span></h2>
     <div class="daily-bar">
-      <span>区间 <b>${first}</b> ～ <b>${endISO}</b>（共 ${all.length} 天）</span>
+      <span class="daily-range">显示
+        <select id="dailyRange">${DAILY_RANGES.map(([v, t]) => `<option value="${v}" ${dailyRange === v ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      </span>
+      <span>区间 <b>${startISO}</b> ～ <b>${endISO}</b>（共 ${all.length} 天）</span>
       <span>已登记 <b class="ok">${activeDates.length}</b> 天</span>
       <span>漏登记 <b class="bad">${missDates.length}</b> 天</span>
       <span>日均业绩 <b>${money(avg)}</b></span>
@@ -885,9 +902,29 @@ function refreshDailySummary() {
   const cb = document.getElementById('dailyMissingOnly');
   if (cb) cb.checked = dailyOnlyMissing;
 }
+/* 点某一天 → 把下方「业绩明细」筛到那一天，并滚过去。
+   注意：明细筛选条是静态渲染的（renderRecordViews 只刷表格不重建筛选条），
+   所以这里必须手动把日期回填进两个 date 控件，否则用户看到的筛选条件与实际不符。 */
+function drillDaily(iso) {
+  dailyDrillDate = iso;
+  recFilter.from = iso;
+  recFilter.to = iso;
+  const f = $('#recFFrom'); if (f) f.value = iso;
+  const t = $('#recFTo'); if (t) t.value = iso;
+  renderRecordViews();
+  refreshDailySummary();                 // 重建汇总，让选中行高亮
+  const bar = document.querySelector('.rec-filter');
+  if (bar && bar.scrollIntoView) bar.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  toast('已查看 ' + iso + ' 的明细，下方明细表已同步筛选');
+}
+
 document.addEventListener('change', e => {
   if (e.target && e.target.id === 'dailyMissingOnly') {
     dailyOnlyMissing = !!e.target.checked;
+    refreshDailySummary();
+  }
+  if (e.target && e.target.id === 'dailyRange') {
+    dailyRange = e.target.value;
     refreshDailySummary();
   }
 });
@@ -1654,6 +1691,10 @@ document.addEventListener('click', async e => {
   }
   if (action === 'recf-preset') {
     setRecPreset(btn.dataset.preset);
+    return;
+  }
+  if (action === 'daily-drill') {
+    drillDaily(btn.dataset.date);
     return;
   }
   if (action === 'export-members') {
