@@ -147,6 +147,7 @@ async function doLogin(username, password) {
   timeRange.mode = 'all'; timeRange.from = ''; timeRange.to = ''; timeRange.month = '';
   /* 每次登录都回到「今天」，避免上一个人选的范围（如上月）留给下一个登录的人 */
   repRange.mode = 'today'; repRange.from = repRange.to = today();
+  recFilter.clerkId = ''; recFilter.from = recFilter.to = today();
   /* 首次打开/新设备扫码时，线上账号数据可能还在同步，先给个提示别让用户以为卡住 */
   const btn = $('#lgBtn');
   const oldText = btn ? btn.textContent : '';
@@ -389,7 +390,8 @@ async function exportMonthly() {
 /* --------------------- 业绩明细筛选（员工 / 日期） --------------------- */
 /* 说明：这里的筛选是明细表专用的，与顶部「经营总览时间筛选」相互独立，
    避免顶部选了「本月」导致明细里查不到其它日期的记录。 */
-const recFilter = { clerkId: '', from: '', to: '' };
+/* 默认只显示「今天」，要看别的日期用筛选条（今天/昨天/本月/上月/全部/自定义区间） */
+const recFilter = { clerkId: '', from: today(), to: today() };
 
 function recStaffOptions() {
   const storeName = id => { const s = (cache.stores || []).find(x => x.id === id); return s ? s.name : ''; };
@@ -407,16 +409,29 @@ function recStaffOptions() {
   }).join('');
 }
 
+function recActivePreset() {
+  const t = today();
+  if (recFilter.from === t && recFilter.to === t) return 'today';
+  const y = ymdOf(new Date(Date.now() - 86400000));
+  if (recFilter.from === y && recFilter.to === y) return 'yesterday';
+  const [a, b] = monthBoundsOf(new Date().getFullYear(), new Date().getMonth());
+  if (recFilter.from === a && recFilter.to === b) return 'thisMonth';
+  const [c, d] = monthBoundsOf(new Date().getFullYear(), new Date().getMonth() - 1);
+  if (recFilter.from === c && recFilter.to === d) return 'lastMonth';
+  if (!recFilter.from && !recFilter.to) return 'all';
+  return '';
+}
 function recFilterBarHTML(opts) {
   const withStaff = !(opts && opts.staff === false);
   const presets = [['today', '今天'], ['yesterday', '昨天'], ['thisMonth', '本月'], ['lastMonth', '上月'], ['all', '全部']];
+  const act = recActivePreset();
   return `<div class="time-bar rec-filter">
     <span class="tb-label">明细筛选</span>
     ${withStaff ? `<select id="recFClerk"><option value="">全部员工</option>${recStaffOptions()}</select>` : ''}
     <input type="date" id="recFFrom" value="${recFilter.from}" title="开始日期" />
     <span>至</span>
     <input type="date" id="recFTo" value="${recFilter.to}" title="结束日期" />
-    ${presets.map(([v, t]) => `<button class="btn sm ghost" data-action="recf-preset" data-preset="${v}">${t}</button>`).join('')}
+    ${presets.map(([v, t]) => `<button class="btn sm${v === act ? '' : ' ghost'}" data-action="recf-preset" data-preset="${v}">${t}</button>`).join('')}
     ${withStaff ? `<button class="btn sm warn" data-action="save-all-records">💾 保存全部改动</button>` : ''}
     <button class="btn sm" data-action="export-filtered">导出筛选结果</button>
     <span class="muted" style="font-size:12px;">仅作用于下方明细表</span>
@@ -461,7 +476,16 @@ function applyRecFilter() {
   recFilter.clerkId = ($('#recFClerk') && $('#recFClerk').value) || '';
   recFilter.from = ($('#recFFrom') && $('#recFFrom').value) || '';
   recFilter.to = ($('#recFTo') && $('#recFTo').value) || '';
+  syncRecPresetBtns();
   renderRecordViews();
+}
+/* 筛选条是静态渲染的（renderRecordViews 不重建它），所以按钮选中态要单独同步 */
+function syncRecPresetBtns() {
+  if (typeof document === 'undefined' || !document.querySelectorAll) return;
+  const act = recActivePreset();
+  document.querySelectorAll('[data-action="recf-preset"]').forEach(b => {
+    b.className = 'btn sm' + (b.dataset.preset === act ? '' : ' ghost');
+  });
 }
 function ymdOf(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
 function monthBoundsOf(yy, mm) {
@@ -479,6 +503,7 @@ function setRecPreset(p) {
   const fi = $('#recFFrom'), ti = $('#recFTo');
   if (fi) fi.value = recFilter.from;
   if (ti) ti.value = recFilter.to;
+  syncRecPresetBtns();
   renderRecordViews();
 }
 async function exportFiltered() {
