@@ -2078,7 +2078,9 @@ async function onDocClick(e) {
     const name = $('#ncName').value.trim();
     if (!name) return toast('请输入大类名称', true);
     const r = await DB.addCategory(name);
-    if (r.ok) { recomputeCache(); renderCategories(); $('#ncName').value = ''; toast('大类已新增'); }
+    /* 必须整页 render()：登记表单的大类下拉（catOptionsHTML）和明细表的小类 datalist
+       都是在 render() 时重建的，只刷 renderCategories() 会导致新大类/小类在下拉里看不到 */
+    if (r.ok) { recomputeCache(); render(); toast('大类已新增'); }
     else toast(r.error || '添加失败', true);
   }
   else if (action === 'rename-cat') {
@@ -2114,8 +2116,10 @@ async function onDocClick(e) {
       if (!seen.has(n)) { seen.add(n); subs.push(typeof s === 'object' ? s : { name: n, rate: 0, fixed: 0, price: 0, memberPrice: 0 }); }
     });
     if (!seen.has(val)) subs.push({ name: val, rate, fixed, price, memberPrice: mprice });
+    else return toast('该小类已存在，直接改那一行即可', true);
     const r = await DB.setSubs(btn.dataset.cat, subs);
-    if (r.ok) { recomputeCache(); renderCategories(); toast('小类已添加' + (rate || fixed || price || mprice ? '（含提成/售价/会员价）' : '')); }
+    /* 整页 render()：明细表的 subList datalist 和登记表单下拉只在 render() 时重建 */
+    if (r.ok) { recomputeCache(); render(); toast('小类已添加' + (rate || fixed || price || mprice ? '（含提成/售价/会员价）' : '')); }
     else toast(r.error && r.error || '添加失败', true);
   }
   else if (action === 'save-sub') {
@@ -2136,14 +2140,14 @@ async function onDocClick(e) {
       return (typeof s === 'object') ? s : { name: n, rate: 0, fixed: 0, price: 0, memberPrice: 0 };
     });
     const r = await DB.setSubs(btn.dataset.cat, subs, newName !== from ? { from, to: newName } : undefined);
-    if (r.ok) { recomputeCache(); renderCategories(); toast(newName !== from ? '小类已重命名' : '小类提成已保存'); }
+    if (r.ok) { recomputeCache(); render(); toast(newName !== from ? '小类已重命名' : '小类提成已保存'); }
     else toast(r.error && r.error || '保存失败', true);
   }
   else if (action === 'del-sub') {
     const catObj = cache.categories ? cache.categories.find(c => c.name === btn.dataset.cat) : null;
     const subs = ((catObj && catObj.subs) || []).filter(s => (typeof s === 'object' ? s.name : s) !== btn.dataset.sub);
     const r = await DB.setSubs(btn.dataset.cat, subs);
-    if (r.ok) { recomputeCache(); renderCategories(); toast('小类已删除'); }
+    if (r.ok) { recomputeCache(); render(); toast('小类已删除'); }
     else toast(r.error || '删除失败', true);
   }
   else if (action === 'reset-pw') {
