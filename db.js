@@ -433,7 +433,10 @@ window.DB = (function () {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
     if (!name) return { ok: false, error: '大类名称必填' };
     if (state.db.categories.some(c => c.name === name)) return { ok: false, error: '该大类已存在' };
-    state.db.categories.push({ name, subs: [] }); publishState(); return { ok: true };
+    /* 必须写 createdAt/updatedAt：合并按时间戳分新旧，缺了会被判成旧数据顶掉 */
+    const now = new Date().toISOString();
+    state.db.categories.push({ name, subs: [], createdAt: now, updatedAt: now });
+    publishState(); return { ok: true };
   }
   async function renameCategory(oldName, newName) {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
@@ -543,6 +546,8 @@ window.DB = (function () {
     if (!Array.isArray(state.db.stores)) state.db.stores = [];
     if (!Array.isArray(state.db.regions)) state.db.regions = [];
     if (!Array.isArray(state.db.categories)) state.db.categories = defaultCategories();
+    /* 大类条目形状兜底：老版本设备可能写入 {name}（没有 subs），渲染和「+ 小类」都会炸 */
+    state.db.categories.forEach(c => { if (c && typeof c === 'object' && !Array.isArray(c.subs)) c.subs = []; });
     if (!state.db.deleted || typeof state.db.deleted !== 'object') state.db.deleted = {};
     ['records', 'users', 'members', 'stores', 'regions', 'categories'].forEach(k => {
       if (!state.db.deleted[k] || typeof state.db.deleted[k] !== 'object') state.db.deleted[k] = {};
