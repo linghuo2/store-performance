@@ -433,6 +433,9 @@ window.DB = (function () {
     if (getCurrentUser().role !== 'boss') return { ok: false, error: '无权限' };
     if (!name) return { ok: false, error: '大类名称必填' };
     if (state.db.categories.some(c => c.name === name)) return { ok: false, error: '该大类已存在' };
+    /* 重新新增以前删过的名字：必须清掉本地旧墓碑，否则自己回显一合并就被抹掉 */
+    state.db.deleted = state.db.deleted || {}; state.db.deleted.categories = state.db.deleted.categories || {};
+    delete state.db.deleted.categories[name];
     /* 必须写 createdAt/updatedAt：合并按时间戳分新旧，缺了会被判成旧数据顶掉 */
     const now = new Date().toISOString();
     state.db.categories.push({ name, subs: [], createdAt: now, updatedAt: now });
@@ -450,6 +453,8 @@ window.DB = (function () {
     if (newName !== oldName) {
       state.db.deleted = state.db.deleted || {}; state.db.deleted.categories = state.db.deleted.categories || {};
       state.db.deleted.categories[oldName] = Date.now();
+      /* 新名字若以前被删过，旧墓碑会让改名后的大类在合并时消失，一并清掉 */
+      delete state.db.deleted.categories[newName];
     }
     publishState(); return { ok: true };
   }
@@ -618,14 +623,19 @@ window.DB = (function () {
   }
   function applyTombstones(d) {
     const del = (d && d.deleted) || {};
+    /* 墓碑只删「比删除动作旧」的实体。历史事故：删过「美容」后重新新增同名大类，
+       设备收到自己/他人的回显一合并，旧墓碑按名字把它抹掉 → toast 提示「大类已新增」
+       但列表里瞬间消失、往上找不到。实体 updatedAt 比墓碑新 = 删除后重新加的，必须保留。 */
+    const tombMs = t => (t && typeof t === 'object') ? (Number(t.deletedAt) || tsOf(t)) : (Number(t) || 0);
+    const alive = (t, entity) => t == null || tsOf(entity) > tombMs(t);
     const drop = (arrName, key) => {
       const m = del[arrName];
       if (!m || !Array.isArray(d[arrName])) return;
-      d[arrName] = d[arrName].filter(x => !(x && x[key] != null && m[String(x[key])]));
+      d[arrName] = d[arrName].filter(x => !(x && x[key] != null && !alive(m[String(x[key])], x)));
     };
     drop('records', 'id'); drop('users', 'id'); drop('members', 'id'); drop('stores', 'id'); drop('regions', 'id');
     const mc = del.categories;
-    if (mc && Array.isArray(d.categories)) d.categories = d.categories.filter(c => !(c && c.name != null && mc[String(c.name)]));
+    if (mc && Array.isArray(d.categories)) d.categories = d.categories.filter(c => !(c && c.name != null && !alive(mc[String(c.name)], c)));
     return d;
   }
   function mergeDB(baseDb, incDb) {
