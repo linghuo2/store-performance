@@ -1826,8 +1826,11 @@ function renderClerk() {
   renderRecordViews();
 }
 
-/* ----------------------------- 行为处理（事件委托） ----------------------------- */
-document.addEventListener('click', async e => {
+/* ----------------------------- 行为处理（事件委托） -----------------------------
+   整个处理器套 try/catch：以前任何一个分支抛异常（比如某台手机上 DOM/数据形状
+   和预期不一样），都会变成无提示的「闪退/点了没反应」，用户完全不知道原因。
+   现在统一兜底，把真实错误弹出来（toast + console），既不白屏又方便排查。 */
+async function onDocClick(e) {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   const action = btn.dataset.action;
@@ -2102,10 +2105,11 @@ document.addEventListener('click', async e => {
     const fixed = card ? parseFloat(card.querySelector('.add-fixed').value) || 0 : 0;
     const price = card ? parseFloat(card.querySelector('.add-price').value) || 0 : 0;
     const mprice = card ? parseFloat(card.querySelector('.add-mprice').value) || 0 : 0;
-    const catObj = cache.categories.find(c => c.name === btn.dataset.cat);
+    const catObj = cache.categories ? cache.categories.find(c => c.name === btn.dataset.cat) : null;
+    /* 老设备写入的大类可能没有 subs 字段，必须兜底，否则点「+ 小类」直接抛异常 */
     const subs = [];
     const seen = new Set();
-    (catObj ? catObj.subs : []).forEach(s => {
+    ((catObj && catObj.subs) || []).forEach(s => {
       const n = (typeof s === 'object') ? s.name : s;
       if (!seen.has(n)) { seen.add(n); subs.push(typeof s === 'object' ? s : { name: n, rate: 0, fixed: 0, price: 0, memberPrice: 0 }); }
     });
@@ -2115,7 +2119,7 @@ document.addEventListener('click', async e => {
     else toast(r.error && r.error || '添加失败', true);
   }
   else if (action === 'save-sub') {
-    const catObj = cache.categories.find(c => c.name === btn.dataset.cat);
+    const catObj = cache.categories ? cache.categories.find(c => c.name === btn.dataset.cat) : null;
     if (!catObj) return toast('大类不存在', true);
     const row = btn.closest('.sub-row');
     const nameInput = row ? row.querySelector('.sub-name-input') : null;
@@ -2136,8 +2140,8 @@ document.addEventListener('click', async e => {
     else toast(r.error && r.error || '保存失败', true);
   }
   else if (action === 'del-sub') {
-    const catObj = cache.categories.find(c => c.name === btn.dataset.cat);
-    const subs = (catObj ? catObj.subs : []).filter(s => (typeof s === 'object' ? s.name : s) !== btn.dataset.sub);
+    const catObj = cache.categories ? cache.categories.find(c => c.name === btn.dataset.cat) : null;
+    const subs = ((catObj && catObj.subs) || []).filter(s => (typeof s === 'object' ? s.name : s) !== btn.dataset.sub);
     const r = await DB.setSubs(btn.dataset.cat, subs);
     if (r.ok) { recomputeCache(); renderCategories(); toast('小类已删除'); }
     else toast(r.error || '删除失败', true);
@@ -2145,6 +2149,12 @@ document.addEventListener('click', async e => {
   else if (action === 'reset-pw') {
     openResetPwModal(id);
   }
+}
+document.addEventListener('click', e => {
+  onDocClick(e).catch(err => {
+    console.error('[操作异常]', err);
+    toast('操作出错：' + ((err && err.message) || err) + '（已记录到控制台，截图发我即可排查）', true);
+  });
 });
 
 /* 重置密码弹窗（老板为他人设置新密码） */
